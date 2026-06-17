@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psma.com/cias/CIAS.json",
+  "title": "CIAS",
+  "description": "Circuit Agnostic Structure (CIAS) — a reusable circuit BRICK: a list of components and how they connect, plus the external terminals (ports) through which the brick wires to other bricks. The SPICE analogy is a .subckt: a definition with a port (node) list and internal elements, NOT runnable by itself. A CIAS carries NO usage meaning — no stage, no role, no 'why', no stimulus, no analysis. That all lives in TAS, where each stage instantiates one CIAS and adds the usage. Names (component/port/connection) are LOCAL to the brick; a TAS that instantiates the brick references its terminals stage-qualified, exactly as a SPICE parent references a subckt instance's nodes. A brick has no magnetic-coupling edges: a coupled inductor or transformer is a single multi-winding PEAS component, whose coupling lives inside its own (MAS) model.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "ports", "components", "connections"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Brick type name, unique in a brick library (e.g. 'half-bridge', 'llc-tank', 'diode-bridge'). Required: it is the lookup key when a stage references a brick by URI (e.g. 'TAS/data/circuits.ndjson?name=half-bridge')."
+    },
+    "ports": {
+      "type": "array",
+      "description": "External terminals of the brick — its connection studs. A TAS stage types and wires these. A net is exposed at a terminal by including a portEndpoint that names it.",
+      "items": { "$ref": "#/$defs/port" }
+    },
+    "components": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "connections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/connection" }
+    }
+  },
+
+  "$defs": {
+
+    "port": {
+      "title": "port",
+      "description": "One external terminal of the brick. Name is unique within the brick; it is the handle a TAS uses to type and wire this terminal.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Terminal name, unique within this brick (e.g. 'dc+', 'sw', 'out')."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What this terminal is, in brick-local terms."
+        }
+      }
+    },
+
+    "component": {
+      "title": "component",
+      "description": "One placed part in the brick: a reference designator (local to the brick) plus the part itself — an inline PEAS document, or a URI string into a part-data file.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "data"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Reference designator unique within THIS brick (e.g. 'Qh', 'Lr', 'C_in'). Connection endpoints refer to it by this name."
+        },
+        "data": {
+          "description": "The component itself: an inline PEAS document, or a URI string into a part-data file (e.g. 'TAS/data/mosfets.ndjson?partNumber=C3M0032120K').",
+          "oneOf": [
+            { "$ref": "https://psma.com/peas/peas.json" },
+            { "type": "string", "minLength": 1 }
+          ]
+        }
+      }
+    },
+
+    "connection": {
+      "title": "connection",
+      "description": "An internal electrical net shared by 2+ endpoints. A net that includes a portEndpoint is exposed at that brick terminal. (Bricks have only electrical nets — no magnetic-coupling edges; coupling lives inside a multi-winding PEAS component.)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "endpoints"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Net name, unique within this brick."
+        },
+        "endpoints": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/endpoint" }
+        }
+      }
+    },
+
+    "endpoint": {
+      "title": "endpoint",
+      "$comment": "An endpoint of a net: either a specific pin of a component, or one of the brick's external terminals (which exposes the net there).",
+      "oneOf": [
+        { "$ref": "#/$defs/pinEndpoint" },
+        { "$ref": "#/$defs/portEndpoint" }
+      ]
+    },
+
+    "pinEndpoint": {
+      "title": "pinEndpoint",
+      "description": "An endpoint that lands on a specific pin of a component in this brick.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "pin"],
+      "properties": {
+        "component": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Refers to a component.name in this brick."
+        },
+        "pin": {
+          "description": "Pin/terminal on the referenced component.",
+          "$ref": "https://psma.com/peas/utils.json#/$defs/componentPort"
+        }
+      }
+    },
+
+    "portEndpoint": {
+      "title": "portEndpoint",
+      "description": "An endpoint that lands on one of this brick's external terminals, exposing the net there.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "port": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Refers to a port.name declared in this brick."
+        }
+      }
+    }
+
+  }
+}
