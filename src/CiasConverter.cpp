@@ -125,27 +125,130 @@ std::map<std::string, std::vector<std::string>> CiasToLtspiceConverter::extract_
 std::string CiasToLtspiceConverter::generate_asy_symbol(const CiasCircuit& circuit) const {
     std::ostringstream asy;
 
-    asy << "Version 4\n";
-    asy << "SymbolType BLOCK\n";
-
-    asy << "RECTANGLE Normal 64 48 304 240\n";
-
     auto ports = get_ordered_ports(circuit);
     int portCount = ports.size();
 
-    int yStart = 64;
-    int ySpacing = std::max(32, 176 / std::max(1, portCount - 1));
+    // Determine symbol type based on circuit properties
+    std::string symbolType = "BLOCK";
+    int width = 64, height = 80;
+    bool isPassive = isPassiveComponent(circuit);
 
+    if (isPassive && portCount == 2) {
+        // Generate appropriate symbol for passive 2-port components
+        symbolType = detectPassiveComponentType(circuit);
+    }
+
+    asy << "Version 4\n";
+    asy << "SymbolType " << symbolType << "\n";
+
+    // Adjust dimensions based on port count and component type
+    if (portCount <= 2) {
+        width = 64;
+        height = 32;
+    } else if (portCount <= 4) {
+        width = 96;
+        height = 64;
+    } else if (portCount <= 6) {
+        width = 128;
+        height = 96;
+    } else {
+        width = 160;
+        height = 128;
+    }
+
+    int rectX0 = 32, rectY0 = 32;
+    int rectX1 = rectX0 + width, rectY1 = rectY0 + height;
+
+    // Draw symbol body
+    if (isPassive && portCount == 2) {
+        // For passive components, draw component-specific shapes
+        if (symbolType == "RESISTOR") {
+            // Draw resistor zigzag between pins
+            asy << "LINE Normal 32 48 40 48\n";
+            asy << "LINE Normal 40 40 48 56\n";
+            asy << "LINE Normal 48 40 56 56\n";
+            asy << "LINE Normal 56 40 64 56\n";
+            asy << "LINE Normal 64 48 72 48\n";
+        } else if (symbolType == "CAPACITOR") {
+            // Draw capacitor (two parallel lines)
+            asy << "LINE Normal 32 48 56 48\n";
+            asy << "LINE Normal 56 40 56 56\n";
+            asy << "LINE Normal 64 40 64 56\n";
+            asy << "LINE Normal 64 48 96 48\n";
+        } else if (symbolType == "INDUCTOR") {
+            // Draw inductor coils
+            asy << "ARC Normal 40 40 48 56 40 48 48 40\n";
+            asy << "ARC Normal 52 40 60 56 52 48 60 40\n";
+            asy << "ARC Normal 64 40 72 56 64 48 72 40\n";
+            asy << "LINE Normal 32 48 40 48\n";
+            asy << "LINE Normal 72 48 96 48\n";
+        } else {
+            // Default BLOCK for unknown passive components
+            asy << "RECTANGLE Normal " << rectX0 << " " << rectY0 << " "
+                << rectX1 << " " << rectY1 << "\n";
+        }
+    } else {
+        // For active/complex components, draw rectangle
+        asy << "RECTANGLE Normal " << rectX0 << " " << rectY0 << " "
+            << rectX1 << " " << rectY1 << "\n";
+    }
+
+    // Calculate pin positions
+    int yStart = rectY0 + 16;
+    int ySpacing = std::max(16, (rectY1 - rectY0 - 32) / std::max(1, portCount - 1));
+
+    // Place pins
     for (size_t i = 0; i < ports.size(); ++i) {
         int y = yStart + (i * ySpacing);
+        // Clamp y to valid range
+        y = std::max(rectY0 + 8, std::min(y, rectY1 - 8));
+
         asy << "PIN 0 " << y << " LEFT 36\n";
         asy << "PINATTR PinName " << ports[i] << "\n";
         asy << "PINATTR SpiceOrder " << (i + 1) << "\n";
     }
 
-    asy << "TEXT 32 144 LEFT 3 " << circuit.name << "\n";
+    // Add text label with circuit name
+    int textY = rectY0 + height / 2;
+    asy << "TEXT " << (rectX0 + 4) << " " << textY << " LEFT 2 " << circuit.name << "\n";
 
     return asy.str();
+}
+
+bool CiasToLtspiceConverter::isPassiveComponent(const CiasCircuit& circuit) const {
+    // Check if all components are passive (R, C, L)
+    for (const auto& comp : circuit.components) {
+        auto type = comp.data.value("type", "unknown");
+        if (!type.is_string()) return false;
+
+        std::string typeStr = type.get<std::string>();
+        if (typeStr != "resistor" && typeStr != "capacitor" && typeStr != "inductor") {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string CiasToLtspiceConverter::detectPassiveComponentType(const CiasCircuit& circuit) const {
+    // Detect component type based on components in circuit
+    bool hasResistor = false, hasCapacitor = false, hasInductor = false;
+
+    for (const auto& comp : circuit.components) {
+        auto type = comp.data.value("type", "unknown");
+        if (!type.is_string()) continue;
+
+        std::string typeStr = type.get<std::string>();
+        if (typeStr == "resistor") hasResistor = true;
+        else if (typeStr == "capacitor") hasCapacitor = true;
+        else if (typeStr == "inductor") hasInductor = true;
+    }
+
+    // Return dominant component type
+    if (hasResistor && !hasCapacitor && !hasInductor) return "RESISTOR";
+    if (hasCapacitor && !hasResistor && !hasInductor) return "CAPACITOR";
+    if (hasInductor && !hasResistor && !hasCapacitor) return "INDUCTOR";
+
+    return "BLOCK";  // Default for mixed or unknown
 }
 
 std::string CiasToLtspiceConverter::generate_lib_subcircuit(const CiasCircuit& circuit) const {
@@ -160,63 +263,59 @@ std::string CiasToLtspiceConverter::generate_lib_subcircuit(const CiasCircuit& c
     lib << "\n";
 
     for (const auto& comp : circuit.components) {
-        lib << "* Component: " << comp.name << "\n";
-        if (comp.data.is_object()) {
-            if (comp.data.contains("type")) {
-                auto type = comp.data.at("type").get<std::string>();
+        // Prefer the original SPICE declaration — it has correct node names and value formatting.
+        if (comp.data.contains("ltspice_declaration") &&
+            comp.data.at("ltspice_declaration").is_string()) {
+            lib << comp.data.at("ltspice_declaration").get<std::string>() << "\n";
+            continue;
+        }
 
-                if (comp.data.contains("value")) {
-                    auto value = comp.data.at("value");
+        // Fallback: reconstruct from type/value (only works when all pins appear in connections).
+        if (!comp.data.contains("type") || !comp.data.contains("value"))
+            throw std::runtime_error(
+                "Component '" + comp.name +
+                "' has no ltspice_declaration and no type/value — cannot generate lib");
 
-                    if (type == "resistor" || type == "Resistor" || type == "R") {
-                        lib << "R" << comp.name << " ";
-                    } else if (type == "capacitor" || type == "Capacitor" || type == "C") {
-                        lib << "C" << comp.name << " ";
-                    } else if (type == "inductor" || type == "Inductor" || type == "L") {
-                        lib << "L" << comp.name << " ";
-                    } else {
-                        lib << "X" << comp.name << " ";
-                    }
+        auto type  = comp.data.at("type").get<std::string>();
+        auto value = comp.data.at("value");
 
-                    auto componentPins = extract_component_pins(circuit);
-                    if (componentPins.find(comp.name) != componentPins.end()) {
-                        for (const auto& pin : componentPins[comp.name]) {
-                            for (const auto& conn : circuit.connections) {
-                                for (const auto& ep : conn.endpoints) {
-                                    if (ep.isPinEndpoint() && ep.component == comp.name &&
-                                        ep.pin == pin) {
-                                        for (const auto& epOther : conn.endpoints) {
-                                            if (epOther.isPortEndpoint()) {
-                                                lib << epOther.port << " ";
-                                                break;
-                                            } else if (epOther.isPinEndpoint()) {
-                                                lib << conn.name << " ";
-                                                break;
-                                            }
-                                        }
-                                        goto next_pin;
-                                    }
-                                }
+        if      (type == "resistor")  lib << "R";
+        else if (type == "capacitor") lib << "C";
+        else if (type == "inductor")  lib << "L";
+        else                          lib << "X";
+
+        lib << comp.name;
+
+        // Emit nodes from connections (works only when all pins have connection entries)
+        auto componentPins = extract_component_pins(circuit);
+        auto it = componentPins.find(comp.name);
+        if (it != componentPins.end()) {
+            for (const auto& pin : it->second) {
+                bool found = false;
+                for (const auto& conn : circuit.connections) {
+                    for (const auto& ep : conn.endpoints) {
+                        if (!ep.isPinEndpoint() || ep.component != comp.name || ep.pin != pin)
+                            continue;
+                        // Prefer port name over internal net name
+                        for (const auto& other : conn.endpoints) {
+                            if (other.isPortEndpoint()) {
+                                lib << " " << other.port;
+                                found = true;
+                                break;
                             }
-                            next_pin:;
                         }
+                        if (!found) lib << " " << conn.name;
+                        found = true;
+                        break;
                     }
-
-                    if (type == "resistor" || type == "Resistor" || type == "R" ||
-                        type == "capacitor" || type == "Capacitor" || type == "C" ||
-                        type == "inductor" || type == "Inductor" || type == "L") {
-
-                        if (value.is_number()) {
-                            lib << value.get<double>();
-                        } else if (value.is_string()) {
-                            lib << value.get<std::string>();
-                        }
-                    }
-
-                    lib << "\n";
+                    if (found) break;
                 }
             }
         }
+
+        if (value.is_number()) lib << " " << value.get<double>();
+        else if (value.is_string()) lib << " " << value.get<std::string>();
+        lib << "\n";
     }
 
     lib << ".ends " << circuit.name << "\n";
