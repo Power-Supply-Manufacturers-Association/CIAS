@@ -266,15 +266,25 @@ std::string CiasToLtspiceConverter::generate_lib_subcircuit(const CiasCircuit& c
     for (const auto& port : ports) {
         lib << " " << port;
     }
-    lib << "\n";
 
-    // Emit .param blocks required by parametric models (DCbias caps, transformer models, etc.)
-    if (circuit.spice_params.is_array()) {
+    // When spice_params contains .param lines, extract key=value pairs and emit them
+    // as PARAMS: on the .subckt header so callers can override them per instance.
+    if (circuit.spice_params.is_array() && !circuit.spice_params.empty()) {
+        std::string params_str;
+        std::regex param_prefix(R"(^\s*\.param\s+)", std::regex_constants::icase);
         for (const auto& param_line : circuit.spice_params) {
-            if (param_line.is_string())
-                lib << param_line.get<std::string>() << "\n";
+            if (!param_line.is_string()) continue;
+            std::string s = std::regex_replace(param_line.get<std::string>(), param_prefix, "");
+            if (!s.empty()) {
+                if (!params_str.empty()) params_str += " ";
+                params_str += s;
+            }
         }
+        if (!params_str.empty())
+            lib << " PARAMS: " << params_str;
     }
+
+    lib << "\n";
 
     for (const auto& comp : circuit.components) {
         // Prefer the original SPICE declaration — it has correct node names and value formatting.
