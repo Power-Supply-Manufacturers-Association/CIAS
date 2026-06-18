@@ -26,6 +26,9 @@ CiasCircuit CiasCircuit::from_json(const json& j) {
         circuit.components.push_back(c);
     }
 
+    if (j.contains("spice_params"))
+        circuit.spice_params = j.at("spice_params");
+
     for (const auto& conn : j.at("connections")) {
         Connection c;
         c.name = conn.at("name").get<std::string>();
@@ -69,6 +72,9 @@ json CiasCircuit::to_json() const {
         c["data"] = comp.data;
         j["components"].push_back(c);
     }
+
+    if (!spice_params.is_null())
+        j["spice_params"] = spice_params;
 
     j["connections"] = json::array();
     for (const auto& conn : connections) {
@@ -261,6 +267,14 @@ std::string CiasToLtspiceConverter::generate_lib_subcircuit(const CiasCircuit& c
         lib << " " << port;
     }
     lib << "\n";
+
+    // Emit .param blocks required by parametric models (DCbias caps, transformer models, etc.)
+    if (circuit.spice_params.is_array()) {
+        for (const auto& param_line : circuit.spice_params) {
+            if (param_line.is_string())
+                lib << param_line.get<std::string>() << "\n";
+        }
+    }
 
     for (const auto& comp : circuit.components) {
         // Prefer the original SPICE declaration — it has correct node names and value formatting.

@@ -38,6 +38,7 @@ struct CiasCircuit {
     std::vector<Port> ports;
     std::vector<Component> components;
     std::vector<Connection> connections;
+    json spice_params;   // raw .param lines from the original .subckt (may be null)
 
     static CiasCircuit from_json(const json& j);
     json to_json() const;
@@ -61,6 +62,9 @@ private:
         const CiasCircuit& circuit) const;
 
     std::vector<std::string> get_ordered_ports(const CiasCircuit& circuit) const;
+
+    bool isPassiveComponent(const CiasCircuit& circuit) const;
+    std::string detectPassiveComponentType(const CiasCircuit& circuit) const;
 };
 
 class LtspiceToRawConverter {
