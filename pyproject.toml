@@ -1,0 +1,29 @@
+[build-system]
+requires = ["scikit-build-core", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "PyCIAS"
+version = "0.1.0"
+description = "Python bindings for CIAS (Circuit Agnostic Structure) conversion"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "OpenMagnetics Contributors"}]
+requires-python = ">=3.8"
+dependencies = [
+    "nlohmann-json>=3.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.15"
+cmake.build-type = "Release"
+
+[[tool.scikit-build.generate]]
+template = "py.typed"
+location = "src"
