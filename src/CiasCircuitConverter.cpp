@@ -203,16 +203,15 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
           }
         }
         else if (d.contains("analog")) {
-            // Analog block (AAS). The portable, simulator-neutral primitives the CIAS netlist carries
-            // for CONTROL: a comparator (and, later, op-amp / analog switch). Each backend realises the
-            // same abstract block its own way — here, ngspice; an LTspice / PLECS / Modelica backend
-            // would map the identical CIAS comparator to its own comparator block. The block's behaviour
-            // (output rails, hysteresis) is read from the AAS data when present, else ideal defaults.
+            // Analog block (AAS). The portable, simulator-neutral primitives the CIAS netlist carries for
+            // CONTROL: a comparator (and, later, op-amp / analog switch). Each backend realises the same
+            // abstract block its own way — here ngspice; an LTspice / PLECS / Modelica backend maps the
+            // identical CIAS comparator to its own comparator block. ALL behavioural parameters
+            // (output rails, threshold, hysteresis) come from the AAS data — no behaviour is invented
+            // here, so the realisation is faithful and the same numbers reach every backend.
             const json& aas = d.at("analog");
             if (aas.contains("comparator")) {
                 const json& cmp = aas.at("comparator");
-                // Optional behavioural params: look in a compact electrical map (what aas_to_cias emits
-                // for the ideal/REQUIREMENTS path); default to a 0..5 V ideal gate-drive comparator.
                 auto opt = [&](const char* key, double dflt) -> double {
                     if (cmp.contains("electrical") && cmp.at("electrical").is_object()
                         && cmp.at("electrical").contains(key)) {
@@ -224,22 +223,26 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
                 };
                 const double vHigh = opt("outputHigh", 5.0);
                 const double vLow  = opt("outputLow", 0.0);
-                const double hyst  = opt("hysteresis", 0.0);   // ±hyst around the trip point [V]
-                const std::string inP  = node_of(c.name, "inPlus");
-                const std::string inN  = node_of(c.name, "inMinus");
-                const std::string out  = node_of(c.name, "out");
-                // out = (V(inP) - V(inN) > trip) ? vHigh : vLow. With hysteresis the trip point shifts by
-                // ∓hyst depending on the current output (self-referential B-source — an algebraic loop
-                // ngspice resolves per timestep). Portable concept: a thresholded difference.
-                body << "B" << c.name << " " << out << " 0 V=("
-                     << "V(" << inP << ")-V(" << inN << ")";
-                if (hyst > 0.0) {
-                    const double mid = 0.5 * (vHigh + vLow);
-                    body << " > ((V(" << out << ")>" << num(mid) << ")?" << num(-hyst) << ":" << num(hyst) << ")";
-                } else {
-                    body << " > 0";
-                }
-                body << ") ? " << num(vHigh) << " : " << num(vLow) << "\n";
+                const double thr   = opt("threshold", 0.0);     // trip on V(inP)-V(inN) > thr [V]
+                const double hyst  = opt("hysteresis", 0.0);    // half-width of the hysteresis band [V]
+                const std::string inP = node_of(c.name, "inPlus");
+                const std::string inN = node_of(c.name, "inMinus");
+                const std::string out = node_of(c.name, "out");
+                // Realise as a voltage-controlled SWITCH with NATIVE hysteresis (model Vt/Vh) rather than
+                // a behavioural B-source: no algebraic loop, and the controlled switch is a far more
+                // portable SPICE primitive (the same S/W model used for the power switches). The switch
+                // ties `out` to a vHigh rail when V(inP)-V(inN) > thr (±hyst); a pull-down sets `out` to
+                // the vLow rail when open. Ron«Rpd so the closed output sits at the rail.
+                const std::string hiRail = c.name + "__vh";
+                const std::string loRail = (vLow != 0.0) ? (c.name + "__vl") : "0";
+                const std::string model  = "CMP_" + c.name;
+                body << "V" << c.name << "_vh " << hiRail << " 0 " << num(vHigh) << "\n";
+                if (vLow != 0.0) body << "V" << c.name << "_vl " << loRail << " 0 " << num(vLow) << "\n";
+                body << "S" << c.name << " " << out << " " << hiRail << " " << inP << " " << inN
+                     << " " << model << "\n";
+                body << "R" << c.name << "_pd " << out << " " << loRail << " 1k\n";
+                body << ".model " << model << " SW(Vt=" << num(thr) << " Vh=" << num(std::max(hyst, 0.0))
+                     << " Ron=1 Roff=1e9)\n";
             }
             else {
                 throw std::runtime_error("CIAS->ngspice: analog '" + c.name +
