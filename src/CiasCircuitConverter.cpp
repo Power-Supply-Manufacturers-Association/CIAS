@@ -202,6 +202,50 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
                          << indNames[j] << " " << num(k) << "\n";
           }
         }
+        else if (d.contains("analog")) {
+            // Analog block (AAS). The portable, simulator-neutral primitives the CIAS netlist carries
+            // for CONTROL: a comparator (and, later, op-amp / analog switch). Each backend realises the
+            // same abstract block its own way — here, ngspice; an LTspice / PLECS / Modelica backend
+            // would map the identical CIAS comparator to its own comparator block. The block's behaviour
+            // (output rails, hysteresis) is read from the AAS data when present, else ideal defaults.
+            const json& aas = d.at("analog");
+            if (aas.contains("comparator")) {
+                const json& cmp = aas.at("comparator");
+                // Optional behavioural params: look in a compact electrical map (what aas_to_cias emits
+                // for the ideal/REQUIREMENTS path); default to a 0..5 V ideal gate-drive comparator.
+                auto opt = [&](const char* key, double dflt) -> double {
+                    if (cmp.contains("electrical") && cmp.at("electrical").is_object()
+                        && cmp.at("electrical").contains(key)) {
+                        const json& v = cmp.at("electrical").at(key);
+                        if (v.is_number()) return v.get<double>();
+                        if (v.is_object() && v.contains("nominal")) return v.at("nominal").get<double>();
+                    }
+                    return dflt;
+                };
+                const double vHigh = opt("outputHigh", 5.0);
+                const double vLow  = opt("outputLow", 0.0);
+                const double hyst  = opt("hysteresis", 0.0);   // ±hyst around the trip point [V]
+                const std::string inP  = node_of(c.name, "inPlus");
+                const std::string inN  = node_of(c.name, "inMinus");
+                const std::string out  = node_of(c.name, "out");
+                // out = (V(inP) - V(inN) > trip) ? vHigh : vLow. With hysteresis the trip point shifts by
+                // ∓hyst depending on the current output (self-referential B-source — an algebraic loop
+                // ngspice resolves per timestep). Portable concept: a thresholded difference.
+                body << "B" << c.name << " " << out << " 0 V=("
+                     << "V(" << inP << ")-V(" << inN << ")";
+                if (hyst > 0.0) {
+                    const double mid = 0.5 * (vHigh + vLow);
+                    body << " > ((V(" << out << ")>" << num(mid) << ")?" << num(-hyst) << ":" << num(hyst) << ")";
+                } else {
+                    body << " > 0";
+                }
+                body << ") ? " << num(vHigh) << " : " << num(vLow) << "\n";
+            }
+            else {
+                throw std::runtime_error("CIAS->ngspice: analog '" + c.name +
+                                         "' block not yet supported (only comparator so far)");
+            }
+        }
         else {
             throw std::runtime_error("CIAS->ngspice: component '" + c.name +
                                      "' has an unknown PEAS discriminator");
