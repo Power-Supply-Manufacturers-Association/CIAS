@@ -224,10 +224,7 @@ std::string CiasToLtspiceConverter::generate_asy_symbol(const CiasCircuit& circu
 bool CiasToLtspiceConverter::isPassiveComponent(const CiasCircuit& circuit) const {
     // Check if all components are passive (R, C, L)
     for (const auto& comp : circuit.components) {
-        auto type = comp.data.value("type", "unknown");
-        if (!type.is_string()) return false;
-
-        std::string typeStr = type.get<std::string>();
+        std::string typeStr = comp.data.value("type", std::string("unknown"));
         if (typeStr != "resistor" && typeStr != "capacitor" && typeStr != "inductor") {
             return false;
         }
@@ -240,10 +237,9 @@ std::string CiasToLtspiceConverter::detectPassiveComponentType(const CiasCircuit
     bool hasResistor = false, hasCapacitor = false, hasInductor = false;
 
     for (const auto& comp : circuit.components) {
-        auto type = comp.data.value("type", "unknown");
-        if (!type.is_string()) continue;
-
-        std::string typeStr = type.get<std::string>();
+        // nlohmann::json::value(key, "default") returns the value's type deduced
+        // from the default (std::string here), NOT a json — so query it directly.
+        std::string typeStr = comp.data.value("type", std::string("unknown"));
         if (typeStr == "resistor") hasResistor = true;
         else if (typeStr == "capacitor") hasCapacitor = true;
         else if (typeStr == "inductor") hasInductor = true;
