@@ -246,9 +246,51 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
                 body << ".model " << model << " SW(Vt=" << num(thr) << " Vh=" << num(std::max(hyst, 0.0))
                      << " Ron=1 Roff=1e9)\n";
             }
+            else if (aas.contains("multiplier")) {
+                // Analog multiplier: out = gain·inA·inB. The portable building block of a control law
+                // that scales one signal by another (here: a current reference shaped by |Vac| and scaled
+                // by a voltage-loop gain). Every backend has a multiply block; ngspice = a B-source.
+                const json& m = aas.at("multiplier");
+                double gain = 1.0;
+                if (m.contains("behavioral") && m.at("behavioral").is_object()
+                    && m.at("behavioral").contains("gain")) gain = m.at("behavioral").at("gain").get<double>();
+                const std::string inA = node_of(c.name, "inA");
+                const std::string inB = node_of(c.name, "inB");
+                const std::string out = node_of(c.name, "out");
+                body << "B" << c.name << " " << out << " 0 V=" << num(gain) << "*V(" << inA << ")*V("
+                     << inB << ")\n";
+            }
+            else if (aas.contains("integrator")) {
+                // Analog integrator / loop compensator: out = clamp(initial + gain·∫(in − reference)dt,
+                // outputLow, outputHigh). The voltage-loop compensator (its `reference` is the setpoint,
+                // baked in so no separate reference-source node is needed). Portable concept (op-amp
+                // integrator); ngspice = a B-source with idt(), clamped against wind-up.
+                const json& it = aas.at("integrator");
+                auto opt = [&](const char* key, double dflt) -> double {
+                    if (it.contains("behavioral") && it.at("behavioral").is_object()
+                        && it.at("behavioral").contains(key))
+                        return it.at("behavioral").at(key).get<double>();
+                    return dflt;
+                };
+                const double gain = opt("gain", 1.0), initial = opt("initial", 0.0);
+                const double ref = opt("reference", 0.0);
+                const double lo = opt("outputLow", -1e9), hi = opt("outputHigh", 1e9);
+                const std::string in   = node_of(c.name, "in");
+                const std::string out  = node_of(c.name, "out");
+                const std::string raw  = c.name + "__raw";
+                // Integrate with the portable SPICE idiom: a behavioural CURRENT source = gain·(in−ref)
+                // charging a 1 F capacitor, so V(raw) = initial + ∫gain·(in−ref)dt (the cap IC sets the
+                // initial value under UIC). The output clamps V(raw) to [outputLow, outputHigh].
+                body << "B" << c.name << "_i 0 " << raw << " I=" << num(gain) << "*(V(" << in << ")-("
+                     << num(ref) << "))\n";
+                body << "C" << c.name << "_int " << raw << " 0 1 IC=" << num(initial) << "\n";
+                body << "B" << c.name << " " << out << " 0 V=(V(" << raw << ")<(" << num(lo) << "))?("
+                     << num(lo) << "):((V(" << raw << ")>(" << num(hi) << "))?(" << num(hi) << "):V("
+                     << raw << "))\n";
+            }
             else {
                 throw std::runtime_error("CIAS->ngspice: analog '" + c.name +
-                                         "' block not yet supported (only comparator so far)");
+                                         "' block not yet supported (comparator / multiplier / integrator)");
             }
         }
         else {
