@@ -260,6 +260,23 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
                 body << "B" << c.name << " " << out << " 0 V=" << num(gain) << "*V(" << inA << ")*V("
                      << inB << ")\n";
             }
+            else if (aas.contains("summer")) {
+                // Weighted summer / difference amp: out = gainA·V(inA) + gainB·V(inB). The portable
+                // building block for a control error (e.g. a current reference minus a sensed current).
+                // ngspice = a B-source.
+                const json& s = aas.at("summer");
+                auto opt = [&](const char* key, double dflt) -> double {
+                    if (s.contains("behavioral") && s.at("behavioral").is_object()
+                        && s.at("behavioral").contains(key)) return s.at("behavioral").at(key).get<double>();
+                    return dflt;
+                };
+                const double gA = opt("gainA", 1.0), gB = opt("gainB", -1.0);
+                const std::string inA = node_of(c.name, "inA");
+                const std::string inB = node_of(c.name, "inB");
+                const std::string out = node_of(c.name, "out");
+                body << "B" << c.name << " " << out << " 0 V=" << num(gA) << "*V(" << inA << ")+"
+                     << num(gB) << "*V(" << inB << ")\n";
+            }
             else if (aas.contains("integrator")) {
                 // Analog integrator / loop compensator: out = clamp(initial + gain·∫(in − reference)dt,
                 // outputLow, outputHigh). The voltage-loop compensator (its `reference` is the setpoint,
