@@ -42,7 +42,13 @@ double nominal_at(const json& data, std::initializer_list<const char*> keys, con
 
 } // namespace
 
-std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
+std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit, SpiceDialect dialect) const {
+    // Behavioural ternary, rendered per dialect: ngspice uses `(cond)?(a):(b)`, LTspice uses `if(cond,a,b)`.
+    // This is the ONLY card-level difference between the two backends — everything else is identical SPICE.
+    auto tern = [dialect](const std::string& cond, const std::string& a, const std::string& b) {
+        return dialect == SpiceDialect::Ltspice ? ("if(" + cond + "," + a + "," + b + ")")
+                                                : ("(" + cond + ")?(" + a + "):(" + b + ")");
+    };
     // (component, pin) -> node
     std::map<std::pair<std::string, std::string>, std::string> pinNode;
     for (const auto& conn : circuit.connections) {
@@ -298,12 +304,34 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
                 // Integrate with the portable SPICE idiom: a behavioural CURRENT source = gain·(in−ref)
                 // charging a 1 F capacitor, so V(raw) = initial + ∫gain·(in−ref)dt (the cap IC sets the
                 // initial value under UIC). The output clamps V(raw) to [outputLow, outputHigh].
+                //
+                // ANTI-WINDUP (back-calculation): the OUTPUT clamp alone does not stop the integrator
+                // STATE (the cap) from charging past [lo,hi] — on a long one-sided transient V(raw) drifts
+                // far beyond the rail and then has to unwind before the output leaves saturation (latent
+                // wind-up). We bleed the cap back toward the active rail whenever V(raw) exceeds it: an
+                // extra current −Kaw·(V(raw)−rail) is summed into the charging source, which is exactly
+                // zero inside [lo,hi] (so the unsaturated integrator is unchanged) and drives V(raw) to
+                // the rail with time constant 1/Kaw when saturated. Kaw is a numerical clamp constant, not
+                // a control gain: τ_aw = 0.1 ms is far faster than any control dynamics here, so the steady
+                // overshoot beyond the rail is gain·err/Kaw (sub-mV) and the designed response is untouched.
+                // Only emitted when the clamp is finite (a genuine rail), so an unclamped integrator is
+                // byte-identical to before.
+                const bool clamped = (lo > -1e8) || (hi < 1e8);
+                const std::string vr = "V(" + raw + ")";
                 body << "B" << c.name << "_i 0 " << raw << " I=" << num(gain) << "*(V(" << in << ")-("
-                     << num(ref) << "))\n";
+                     << num(ref) << "))";
+                if (clamped) {
+                    const double kAw = 1e4;   // anti-windup back-calculation rate [1/s] -> τ_aw = 0.1 ms
+                    const std::string overHi = tern(vr + ">(" + num(hi) + ")", vr + "-(" + num(hi) + ")", "0");
+                    const std::string undLo  = tern(vr + "<(" + num(lo) + ")", vr + "-(" + num(lo) + ")", "0");
+                    body << "-" << num(kAw) << "*((" << overHi << ")+(" << undLo << "))";
+                }
+                body << "\n";
                 body << "C" << c.name << "_int " << raw << " 0 1 IC=" << num(initial) << "\n";
-                body << "B" << c.name << " " << out << " 0 V=(V(" << raw << ")<(" << num(lo) << "))?("
-                     << num(lo) << "):((V(" << raw << ")>(" << num(hi) << "))?(" << num(hi) << "):V("
-                     << raw << "))\n";
+                // output = clamp(V(raw), lo, hi)
+                const std::string clampExpr =
+                    tern(vr + "<(" + num(lo) + ")", num(lo), tern(vr + ">(" + num(hi) + ")", num(hi), vr));
+                body << "B" << c.name << " " << out << " 0 V=" << clampExpr << "\n";
             }
             else {
                 throw std::runtime_error("CIAS->ngspice: analog '" + c.name +
@@ -318,18 +346,18 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
     return body.str();
 }
 
-std::string CiasToNgspiceConverter::to_subckt(const CiasCircuit& circuit) const {
+std::string CiasToNgspiceConverter::to_subckt(const CiasCircuit& circuit, SpiceDialect dialect) const {
     std::ostringstream out;
     out << ".subckt " << circuit.name;
     for (const auto& p : circuit.ports) out << " " << p.name;
     out << "\n";
-    out << to_cards(circuit);
+    out << to_cards(circuit, dialect);
     out << ".ends " << circuit.name << "\n";
     return out.str();
 }
 
-std::string CiasToNgspiceConverter::to_subckt_json(const json& ciasJson) const {
-    return to_subckt(CiasCircuit::from_json(ciasJson));
+std::string CiasToNgspiceConverter::to_subckt_json(const json& ciasJson, SpiceDialect dialect) const {
+    return to_subckt(CiasCircuit::from_json(ciasJson), dialect);
 }
 
 } // namespace CIAS

@@ -21,15 +21,23 @@
 
 namespace CIAS {
 
+// SPICE dialect for the emitter. The CIAS netlist is simulator-AGNOSTIC; the converter renders it to a
+// concrete dialect here. Almost every card (R/C/L/D/S, .model SW/D, the multiplier/summer B-sources, the
+// comparator switch, SIN sources, .tran, .ic) is byte-identical between ngspice and LTspice — the ONLY
+// body-level difference is the behavioural ternary `(c)?(a):(b)` (ngspice) vs `if(c,a,b)` (LTspice),
+// which appears in the integrator. Having a SECOND backend is what proves the IR→backend boundary is not
+// ngspice-shaped (see tests/test_ltspice_backend.cpp).
+enum class SpiceDialect { Ngspice, Ltspice };
+
 class CiasToNgspiceConverter {
 public:
     // Emit ".subckt <name> <ports...> ... .ends" for an atom-brick.
-    std::string to_subckt(const CiasCircuit& circuit) const;
-    std::string to_subckt_json(const json& ciasJson) const;
+    std::string to_subckt(const CiasCircuit& circuit, SpiceDialect dialect = SpiceDialect::Ngspice) const;
+    std::string to_subckt_json(const json& ciasJson, SpiceDialect dialect = SpiceDialect::Ngspice) const;
 
     // Emit just the element cards (no .subckt wrapper) — used by the deck assembler that supplies
     // its own testbench. Node names are the brick's nets (ports included).
-    std::string to_cards(const CiasCircuit& circuit) const;
+    std::string to_cards(const CiasCircuit& circuit, SpiceDialect dialect = SpiceDialect::Ngspice) const;
 };
 
 } // namespace CIAS
