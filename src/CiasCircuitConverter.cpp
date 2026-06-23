@@ -212,10 +212,12 @@ std::string CiasToNgspiceConverter::to_cards(const CiasCircuit& circuit) const {
             const json& aas = d.at("analog");
             if (aas.contains("comparator")) {
                 const json& cmp = aas.at("comparator");
+                // Behavioural params come from the AAS comparator's agnostic `behavioral` block
+                // (outputHigh / outputLow / threshold / hysteresis), NOT the datasheet `electrical`.
                 auto opt = [&](const char* key, double dflt) -> double {
-                    if (cmp.contains("electrical") && cmp.at("electrical").is_object()
-                        && cmp.at("electrical").contains(key)) {
-                        const json& v = cmp.at("electrical").at(key);
+                    if (cmp.contains("behavioral") && cmp.at("behavioral").is_object()
+                        && cmp.at("behavioral").contains(key)) {
+                        const json& v = cmp.at("behavioral").at(key);
                         if (v.is_number()) return v.get<double>();
                         if (v.is_object() && v.contains("nominal")) return v.at("nominal").get<double>();
                     }
