@@ -449,25 +449,51 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                          << " I=ddt(" << subst_vars(expr, sense, n1, n2) << ")\n";
                 }
             }
-            else if (nature == "conductance") {
-                // Static nonlinear I-V table i(v): a behavioral current source whose value
-                // is the piecewise-linear table evaluated at the terminal voltage.
-                const json& pts = beh.at("points");
-                std::ostringstream tbl;
-                bool first = true;
-                for (const auto& pt : pts) {
-                    if (!first) tbl << ", ";
-                    tbl << num(pt.at("voltage").get<double>()) << ", "
-                        << num(pt.at("current").get<double>());
-                    first = false;
-                }
-                const std::string vctrl = "V(" + n1 + "," + n2 + ")";
+            else if (nature == "controlled") {
+                // Controlled/dependent source: value = f(own terminals). Emit a B-source
+                // between the 'across' pins; substitute i(p,q)->I(Vsense) (synthesising a
+                // 0 V sense per distinct i()) and v(p,q)->V(node,node); pwl()->table() for LTspice.
+                const json& out = beh.at("output");
+                const std::string quantity = out.at("quantity").get<std::string>();
+                const json& across = out.at("across");
+                const std::string na = node_of(c.name, across[0].get<std::string>());
+                const std::string nb = node_of(c.name, across[1].get<std::string>());
+                std::string expr = out.at("expression").get<std::string>();
+
+                auto subst = [&](const std::string& fn, bool isCurrent,
+                                 std::ostringstream& senses, int& k) {
+                    std::regex re("\\b" + fn + "\\s*\\(\\s*(\\w+)\\s*,\\s*(\\w+)\\s*\\)",
+                                  std::regex::icase);
+                    std::string res;
+                    auto last = expr.cbegin();
+                    for (auto it = std::sregex_iterator(expr.begin(), expr.end(), re);
+                         it != std::sregex_iterator(); ++it) {
+                        const std::smatch& m = *it;
+                        res.append(last, expr.cbegin() + m.position());
+                        const std::string p = node_of(c.name, m[1].str());
+                        const std::string q = node_of(c.name, m[2].str());
+                        if (isCurrent) {
+                            const std::string sense = "Vsns_" + c.name + "_" + std::to_string(k++);
+                            senses << sense << " " << p << " " << q << " DC 0\n";
+                            res += "I(" + sense + ")";
+                        } else {
+                            res += "V(" + p + "," + q + ")";
+                        }
+                        last = expr.cbegin() + m.position() + m.length();
+                    }
+                    res.append(last, expr.cend());
+                    expr = res;
+                };
+                std::ostringstream senses;
+                int k = 0;
+                subst("i", true, senses, k);   // i(p,q) -> I(Vsense)
+                subst("v", false, senses, k);  // v(p,q) -> V(node,node)
                 if (dialect == SpiceDialect::Ltspice)
-                    body << "B" << c.name << " " << n1 << " " << n2
-                         << " I=table(" << vctrl << "," << tbl.str() << ")\n";
-                else
-                    body << "B" << c.name << " " << n1 << " " << n2
-                         << " I=pwl(" << vctrl << "," << tbl.str() << ")\n";
+                    expr = std::regex_replace(expr, std::regex(R"(\bpwl\s*\()", std::regex::icase),
+                                              "table(");
+                body << senses.str();
+                body << "B" << c.name << " " << na << " " << nb << " "
+                     << (quantity == "current" ? "I=" : "V=") << expr << "\n";
             }
             else if (nature == "chan") {
                 // Chan saturable core (LTspice Hc/Bs/Br material + A/Lm/Lg/N geometry).
@@ -479,12 +505,15 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     auto bhval = [&](const char* key) -> std::string {
                         const json& v = p.at(key);
                         if (v.is_number()) return num(v.get<double>());
+                        // Temperature curve -> tbl(temp,...). LTspice requires an expression
+                        // attribute to be braced ({...}); a bare tbl() on Hc=/Bs=/Br= is read
+                        // as 0 ("missing coercive force").
                         std::ostringstream t;
-                        t << "tbl(temp";
+                        t << "{tbl(temp";
                         for (const auto& pt : v.at("perTemperature"))
                             t << "," << num(pt.at("temperature").get<double>())
                               << "," << num(pt.at("value").get<double>());
-                        t << ")";
+                        t << ")}";
                         return t.str();
                     };
                     body << "L" << c.name << " " << ps << " " << pe
