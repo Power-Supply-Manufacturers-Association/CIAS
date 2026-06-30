@@ -1,43 +1,72 @@
 #pragma once
 
-// CiasCircuitConverter — "CIAS converts a circuit to ngspice / LTspice / ...".
+// CiasCircuitConverter — converts a CIAS circuit to any supported circuit simulator's netlist format.
 //
-// Input: a CIAS brick whose components are ideal ATOM PEAS docs (the output of the per-family
-// to_cias generators, possibly merged by the TAS assembler). The converter dispatches on each
-// component's PEAS discriminator and emits the SPICE element card(s):
-//   resistor      -> R card                (pins 1,2)
-//   capacitor     -> C card                (pins 1,2)
-//   semiconductor mosfet -> S (vc-switch) + .model SW   (pins drain,gate,source)
-//   semiconductor diode  -> D + .model D                (pins anode,cathode)
-//   magnetic      -> L per winding + K coupling (the one multi-winding component expanded here;
-//                    pins primary_start/end, secondary{i}_start/end)
-// Nodes are resolved from the brick's connections (a net exposed at a port takes the port name).
+// Supported targets:
+//   Ngspice  — PEAS-atom rendering (resistor/capacitor/magnetic/semiconductor/analog)
+//              with ngspice SPICE syntax.
+//   Ltspice  — if any component carries a 'ltspice_declaration' field, emits a passthrough
+//              ".subckt NAME ports [PARAMS:...]\n<original declarations>\n.ends" (round-trip mode).
+//              Otherwise: PEAS-atom rendering with LTspice syntax (only the behavioral ternary
+//              in the integrator analog block differs from ngspice).
+//   NL5, Simba, Plecs — throw "not yet implemented" (stubs for future backends).
 //
-// This is the ngspice emitter (Phase 2). LTspice/PSIM/Simba/NL5 share the dispatch; ngspice is the
-// runnable target. No silent fallbacks: an unwired pin / unknown discriminator / missing value throws.
+// Input: a CIAS circuit whose components are either:
+//   (a) PEAS-enriched atoms (resistor/capacitor/magnetic/semiconductor/analog discriminators) — MAS pipeline
+//   (b) LTspice-extracted circuits (ltspice_declaration on each component) — WE library extraction
+//
+// Node resolution (for PEAS-atom mode): via the brick's connections graph (port nets take the port name).
+// No silent fallbacks: unknown discriminator / unwired pin / missing value throws.
 
-#include "CiasConverter.hpp"   // CiasCircuit struct + from_json
+#include "CiasConverter.hpp"
 #include <string>
+#include <memory>
+#include <vector>
 
 namespace CIAS {
 
-// SPICE dialect for the emitter. The CIAS netlist is simulator-AGNOSTIC; the converter renders it to a
-// concrete dialect here. Almost every card (R/C/L/D/S, .model SW/D, the multiplier/summer B-sources, the
-// comparator switch, SIN sources, .tran, .ic) is byte-identical between ngspice and LTspice — the ONLY
-// body-level difference is the behavioural ternary `(c)?(a):(b)` (ngspice) vs `if(c,a,b)` (LTspice),
-// which appears in the integrator. Having a SECOND backend is what proves the IR→backend boundary is not
-// ngspice-shaped (see tests/test_ltspice_backend.cpp).
+enum class CircuitSimulator { Ngspice, Ltspice, NL5, Simba, Plecs };
+
+// Internal SPICE dialect — kept for the emit_peas_cards / ternary dispatch.
 enum class SpiceDialect { Ngspice, Ltspice };
 
-class CiasToNgspiceConverter {
+class CiasCircuitConverter {
 public:
-    // Emit ".subckt <name> <ports...> ... .ends" for an atom-brick.
-    std::string to_subckt(const CiasCircuit& circuit, SpiceDialect dialect = SpiceDialect::Ngspice) const;
-    std::string to_subckt_json(const json& ciasJson, SpiceDialect dialect = SpiceDialect::Ngspice) const;
+    explicit CiasCircuitConverter(CircuitSimulator target = CircuitSimulator::Ngspice);
 
-    // Emit just the element cards (no .subckt wrapper) — used by the deck assembler that supplies
-    // its own testbench. Node names are the brick's nets (ports included).
-    std::string to_cards(const CiasCircuit& circuit, SpiceDialect dialect = SpiceDialect::Ngspice) const;
+    // Factory — returns a heap-allocated converter for the requested simulator.
+    static std::shared_ptr<CiasCircuitConverter> create(CircuitSimulator target);
+
+    // Emit ".subckt <name> <ports> [PARAMS: ...]\n<element cards>\n.ends <name>".
+    // For Ltspice + ltspice_declaration present: passthrough with PARAMS: header.
+    // For Ngspice/Ltspice without ltspice_declaration: PEAS-atom rendering.
+    // For NL5/Simba/Plecs: throws runtime_error.
+    std::string to_subckt(const CiasCircuit& circuit) const;
+    std::string to_subckt_json(const json& ciasJson) const;
+
+    // Element cards only (no .subckt wrapper) — for assembler decks.
+    // Valid for Ngspice and Ltspice PEAS-atom mode only; throws for others.
+    std::string to_cards(const CiasCircuit& circuit) const;
+
+private:
+    CircuitSimulator target_;
+
+    SpiceDialect spice_dialect() const;
+    bool has_ltspice_declarations(const CiasCircuit& circuit) const;
+    std::string emit_peas_cards(const CiasCircuit& circuit, SpiceDialect dialect) const;
+    std::string emit_ltspice_passthrough(const CiasCircuit& circuit) const;
 };
+
+// Backward-compatible alias — existing code using CiasToNgspiceConverter keeps compiling.
+// CiasCircuitConverter(CircuitSimulator::Ngspice) is the default, so the zero-arg constructor
+// and to_cards()/to_subckt() signatures behave identically to the old class.
+using CiasToNgspiceConverter = CiasCircuitConverter;
+
+// Structural validator — returns human-readable problems ([] if the brick is well-formed).
+// Complements the JSON-Schema (Python) validator with graph-level checks the schema cannot
+// express: unique names, every pinEndpoint references a real component, every portEndpoint
+// references a declared port, connections have >=2 endpoints, each component carries exactly
+// one known discriminator (or a URI string).
+std::vector<std::string> validate_cias_structure(const CiasCircuit& circuit);
 
 } // namespace CIAS
