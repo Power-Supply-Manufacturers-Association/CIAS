@@ -168,6 +168,10 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
             // Ideal component: electrical value lives in inputs.designRequirements.
             double r = nominal_at(d, {"inputs", "designRequirements", "resistance"},
                                   "resistor " + c.name);
+            // A 0 Ohm resistor is a short (e.g. a dc-0 ammeter source we mapped to R).
+            // LTspice rejects R=0 ("Resistance must not be zero"); emit a negligible
+            // value instead (electrically a short, far below any modelled impedance).
+            if (r == 0.0) r = 1e-12;
             body << "R" << c.name << " " << node_of(c.name, "1") << " " << node_of(c.name, "2")
                  << " " << num(r) << "\n";
         }
@@ -459,6 +463,24 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 const std::string na = node_of(c.name, across[0].get<std::string>());
                 const std::string nb = node_of(c.name, across[1].get<std::string>());
                 std::string expr = out.at("expression").get<std::string>();
+
+                // Linear VCCS/VCVS '(K)*v(p,q)' -> NATIVE G/E element (exact). A behavioral
+                // B-source is mathematically equivalent but carries a small per-element error
+                // that compounds catastrophically in tightly-coupled networks (e.g. a CM choke
+                // with 1000+ gyrator sources). Native E/G has no such error.
+                {
+                    std::smatch lm;
+                    if (std::regex_match(expr, lm,
+                            std::regex(R"(^\(\s*([-+0-9.eE]+)\s*\)\s*\*\s*v\(\s*(\w+)\s*,\s*(\w+)\s*\)$)",
+                                       std::regex::icase))) {
+                        const std::string kgain = lm[1].str();
+                        const std::string cp = node_of(c.name, lm[2].str());
+                        const std::string cn = node_of(c.name, lm[3].str());
+                        body << (quantity == "current" ? "G" : "E") << c.name << " "
+                             << na << " " << nb << " " << cp << " " << cn << " " << kgain << "\n";
+                        continue;
+                    }
+                }
 
                 auto subst = [&](const std::string& fn, bool isCurrent,
                                  std::ostringstream& senses, int& k) {
