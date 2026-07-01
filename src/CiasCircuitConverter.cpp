@@ -870,7 +870,6 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 expr = std::regex_replace(expr, std::regex(R"(\bv\b(?!\s*\())"), own_voltage);
                 return expr;
             };
-
             if (nature == "flux" || nature == "charge") {
                 check_pins(c.name, "behavioral", {"1", "2"});
                 const std::string n1 = node_of(c.name, "1");
@@ -1121,11 +1120,30 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     "' — expected flux/charge/chan/controlled/source/switch");
             }
         }
+        else if (d.contains("transmissionLine")) {
+            // Distributed 2-port line: SPICE O + .model LTRA(len R L C [G]).
+            const json& tl  = d.at("transmissionLine");
+            const json& pul = tl.at("perUnitLength");
+            const std::string ip = node_of(c.name, "in_p");
+            const std::string in = node_of(c.name, "in_n");
+            const std::string op = node_of(c.name, "out_p");
+            const std::string on = node_of(c.name, "out_n");
+            const std::string model = "LTRA_" + c.name;
+            body << "O" << c.name << " " << ip << " " << in << " " << op << " " << on
+                 << " " << model << "\n";
+            body << ".model " << model << " LTRA(len=" << num(tl.at("length").get<double>())
+                 << " R=" << num(pul.at("resistance").get<double>())
+                 << " L=" << num(pul.at("inductance").get<double>())
+                 << " C=" << num(pul.at("capacitance").get<double>());
+            if (pul.contains("conductance"))
+                body << " G=" << num(pul.at("conductance").get<double>());
+            body << ")\n";
+        }
         else {
             throw std::runtime_error(
                 "CiasCircuitConverter: component '" + c.name +
                 "' has an unknown PEAS discriminator — expected resistor/capacitor/magnetic/"
-                "semiconductor/analog/timeBase/behavioral");
+                "semiconductor/analog/timeBase/behavioral/transmissionLine");
         }
     }
     return body.str();
