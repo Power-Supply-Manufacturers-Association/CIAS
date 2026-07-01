@@ -1109,15 +1109,30 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 }
             }
             else if (nature == "frequencyResponse") {
-                throw std::runtime_error(
-                    "CiasCircuitConverter: behavioral nature 'frequencyResponse' (tabulated H(f)) "
-                    "is not implemented yet for component '" + c.name + "'");
+                // Tabulated transfer function H(f): SPICE E (voltage) / G (current) FREQ list.
+                // Stored magnitude is linear, phase is radians -> emit MAG (linear) with phase
+                // converted to degrees (LTspice/ngspice FREQ table convention).
+                const std::string quantity = beh.at("quantity").get<std::string>();
+                const json& across  = beh.at("across");
+                const json& control = beh.at("control");
+                const std::string op = node_of(c.name, across[0].get<std::string>());
+                const std::string on = node_of(c.name, across[1].get<std::string>());
+                const std::string cp = node_of(c.name, control[0].get<std::string>());
+                const std::string cn = node_of(c.name, control[1].get<std::string>());
+                body << (quantity == "current" ? "G" : "E") << c.name << " " << op << " " << on
+                     << " FREQ {V(" << cp << "," << cn << ")}= MAG";
+                const double RAD2DEG = 57.29577951308232;  // 180/pi
+                for (const auto& pt : beh.at("points"))
+                    body << " (" << num(pt.at("frequency").get<double>())
+                         << "," << num(pt.at("magnitude").get<double>())
+                         << "," << num(pt.at("phase").get<double>() * RAD2DEG) << ")";
+                body << "\n";
             }
             else {
                 throw std::runtime_error(
                     "CiasCircuitConverter: behavioral component '" + c.name +
                     "' has unknown nature '" + nature +
-                    "' — expected flux/charge/chan/controlled/source/switch");
+                    "' — expected flux/charge/chan/controlled/source/switch/frequencyResponse");
             }
         }
         else if (d.contains("transmissionLine")) {
