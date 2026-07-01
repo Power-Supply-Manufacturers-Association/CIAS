@@ -146,6 +146,25 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
             }
     };
 
+    // Does this circuit contain any K-coupled (multi-winding) magnetic? Only then does a
+    // mutual-inductance matrix exist to be ill-conditioned, so only then do inductors get
+    // the tiny native Rser regularizer. An ISOLATED ideal inductor must stay ideal: adding
+    // even 1e-9 Ω shifts LTspice's low-frequency |Z| (a sub-milliohm ideal-inductor quirk),
+    // which would make single-inductor parts diverge from the vendor model.
+    bool circuitHasCoupling = false;
+    for (const auto& c : circuit.components) {
+        const json& d = c.data;
+        if (d.is_object() && d.contains("magnetic")
+            && d.contains("inputs") && d.at("inputs").is_object()
+            && d.at("inputs").contains("designRequirements")
+            && d.at("inputs").at("designRequirements").contains("turnsRatios")
+            && d.at("inputs").at("designRequirements").at("turnsRatios").is_array()
+            && !d.at("inputs").at("designRequirements").at("turnsRatios").empty()) {
+            circuitHasCoupling = true;
+            break;
+        }
+    }
+
     std::ostringstream body;
     for (const auto& c : circuit.components) {
         const json& d = c.data;
@@ -339,10 +358,19 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     for (const auto& e : *tr)
                         ratios.push_back(resolved_leaf(e, "turns ratio of magnetic " + c.name));
                 }
+                // A pure-ideal inductor makes LTspice's mutual-inductance matrix
+                // ill-conditioned (singular at k=1, near-singular otherwise) — a small
+                // uncoupled winding beside a k=1 pair yields garbage |Z| (100s of %). The
+                // real winding resistance normally regularizes it, but here DCR lives in a
+                // sibling R (for losslessness/composability), leaving the L ideal. Emit a
+                // negligible native Rser (1e-9 Ω ≪ any real DCR) purely as a numerical
+                // regularizer. LTspice-only: ngspice has no L Rser= (and caps k already).
+                const std::string lReg =
+                    (dialect == SpiceDialect::Ltspice && circuitHasCoupling) ? " Rser=1e-9" : "";
                 std::vector<std::string> indNames;
                 const std::string lpri = "L" + c.name + "_pri";
                 body << lpri << " " << node_of(c.name, "primary_start") << " "
-                     << node_of(c.name, "primary_end") << " " << num(lp) << "\n";
+                     << node_of(c.name, "primary_end") << " " << num(lp) << lReg << "\n";
                 indNames.push_back(lpri);
 
                 for (size_t i = 0; i < ratios.size(); ++i) {
@@ -353,7 +381,7 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     const std::string idx = std::to_string(i + 1);
                     const std::string lsec = "L" + c.name + "_sec" + idx;
                     body << lsec << " " << node_of(c.name, "secondary" + idx + "_start") << " "
-                         << node_of(c.name, "secondary" + idx + "_end") << " " << num(ls) << "\n";
+                         << node_of(c.name, "secondary" + idx + "_end") << " " << num(ls) << lReg << "\n";
                     indNames.push_back(lsec);
                 }
 
