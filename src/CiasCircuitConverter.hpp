@@ -4,7 +4,14 @@
 //
 // Supported targets:
 //   Ngspice / Ltspice — PEAS-atom rendering (resistor / capacitor / magnetic / semiconductor /
-//                       analog / behavioral discriminators). The two dialects differ in:
+//                       analog / timeBase / behavioral discriminators). The timeBase atoms
+//                       (TBAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
+//                       emit one canonical template each: fixed oscillators / astable timers as
+//                       native PULSE/SIN(E) sources, VCOs as a phase-accumulator (clamped
+//                       B-current into 1 F + floor()-wrap shaping B-source), latches and
+//                       monostable timers as self-holding B-source state nodes with 1 ns RCs,
+//                       sample/holds as ideal switch + 1 nF hold cap + E-buffer.
+//                       The two dialects differ in:
 //                       behavioral ternary ((c)?(a):(b) vs if(c,a,b)), flux/charge realization
 //                       (B+ddt()+sense vs native Flux=/Q= attributes), Chan core (closed-form
 //                       B-H behavioral model vs native Hc/Bs/Br inductor), K-coefficient cap

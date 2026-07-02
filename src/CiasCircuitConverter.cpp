@@ -442,10 +442,323 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 if (lo) clampExpr = tern(vr + "<(" + num(*lo) + ")", num(*lo), clampExpr);
                 body << "B" << c.name << " " << out << " 0 V=" << clampExpr << "\n";
             }
+            else if (aas.contains("sampleHold")) {
+                // Ideal S/H (AAS sampleHold behavioral, PEAS-RFC 0001 §5.2/§7): one canonical
+                // template per mode — ideal switch + 1 nF hold capacitor + unity E-buffer.
+                // trackWhileActive closes the switch while the trigger condition holds;
+                // sampleOnEdge derives a narrow (~7 ns) sampling pulse from an edge-detect RC
+                // (tau 10 ns) so the 1 ns switch+cap tracking constant settles within it.
+                check_pins(c.name, "sampleHold", {"in", "trg", "out"});
+                const json& b = behavioral_of(aas.at("sampleHold"), "sampleHold");
+                auto required_str = [&](const char* key) -> std::string {
+                    if (!b.contains(key) || !b.at(key).is_string())
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: analog sampleHold '" + c.name +
+                            "' behavioral block is missing required '" + std::string(key) + "'");
+                    return b.at(key).get<std::string>();
+                };
+                const std::string mode     = required_str("mode");
+                const std::string polarity = required_str("polarity");
+                const double thr = required(b, "threshold", "sampleHold");
+                if (polarity != "activeHigh" && polarity != "activeLow")
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: sampleHold '" + c.name + "' has unknown polarity '" +
+                        polarity + "' (expected activeHigh/activeLow)");
+                const std::string in   = node_of(c.name, "in");
+                const std::string trg  = node_of(c.name, "trg");
+                const std::string out  = node_of(c.name, "out");
+                const std::string hold = c.name + "__hold";
+                const std::string ctl  = c.name + "__ctl";
+                const std::string model = "SHM_" + c.name;
+                // Trigger condition, polarity-normalised to "active = 1".
+                const std::string actCond = "V(" + trg + ")" + (polarity == "activeHigh" ? ">" : "<")
+                                          + "(" + num(thr) + ")";
+                if (mode == "trackWhileActive") {
+                    body << "B" << c.name << "_ctl " << ctl << " 0 V=" << tern(actCond, "1", "0") << "\n";
+                } else if (mode == "sampleOnEdge") {
+                    const std::string lvl  = c.name + "__lvl";
+                    const std::string lvld = c.name + "__lvld";
+                    body << "B" << c.name << "_lvl " << lvl << " 0 V=" << tern(actCond, "1", "0") << "\n";
+                    body << "R" << c.name << "_ed " << lvl << " " << lvld << " 10\n";
+                    body << "C" << c.name << "_ed " << lvld << " 0 1n\n";
+                    body << "B" << c.name << "_ctl " << ctl << " 0 V="
+                         << tern("V(" + lvl + ")-V(" + lvld + ")>0.5", "1", "0") << "\n";
+                } else {
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: sampleHold '" + c.name + "' has unknown mode '" +
+                        mode + "' (expected trackWhileActive/sampleOnEdge)");
+                }
+                body << "S" << c.name << " " << in << " " << hold << " " << ctl << " 0 " << model << "\n";
+                body << "C" << c.name << "_hold " << hold << " 0 1n\n";
+                body << "E" << c.name << " " << out << " 0 " << hold << " 0 1\n";
+                // Vt/Vh (not Von/Voff): ngspice-42 ignores Von/Voff on SW models; Vt/Vh is the
+                // form both dialects accept (same precedent as the comparator emission).
+                body << ".model " << model << " SW(Vt=0.5 Vh=0.2 Ron=1 Roff=1e9)\n";
+            }
             else {
                 throw std::runtime_error(
                     "CiasCircuitConverter: analog '" + c.name +
-                    "' block type not supported (comparator/multiplier/summer/integrator only)");
+                    "' block type not supported (comparator/multiplier/summer/integrator/"
+                    "sampleHold only)");
+            }
+        }
+        else if (d.contains("timeBase")) {
+            // TBAS time-base atoms (PEAS-RFC 0001 §7): oscillator / timer / latch. Realization
+            // requires the family's `behavioral` block — a datasheet-only orderable part must
+            // NOT silently become a fabricated ideal block (no-fallbacks rule). Each canonical
+            // subcircuit below is ONE template; only parameter values vary per call.
+            const json& tb = d.at("timeBase");
+            std::string famKey;
+            for (const char* k : {"oscillator", "timer", "latch"})
+                if (tb.contains(k)) { famKey = k; break; }
+            if (famKey.empty())
+                throw std::runtime_error(
+                    "CiasCircuitConverter: timeBase '" + c.name +
+                    "' has no oscillator/timer/latch family");
+            const json& fam = tb.at(famKey);
+            if (!fam.contains("behavioral") || !fam.at("behavioral").is_object())
+                throw std::runtime_error(
+                    "CiasCircuitConverter: timeBase " + famKey + " '" + c.name +
+                    "' has no behavioral block — cannot realize a datasheet-only part as an "
+                    "ideal element");
+            const json& b = fam.at("behavioral");
+            auto required = [&](const char* key) -> double {
+                if (!b.contains(key))
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: timeBase " + famKey + " '" + c.name +
+                        "' behavioral block is missing required '" + key + "'");
+                return resolved_leaf(b.at(key), std::string(key) + " of " + c.name);
+            };
+            auto required_str = [&](const char* key) -> std::string {
+                if (!b.contains(key) || !b.at(key).is_string())
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: timeBase " + famKey + " '" + c.name +
+                        "' behavioral block is missing required '" + std::string(key) + "'");
+                return b.at(key).get<std::string>();
+            };
+            const double kTwoPi = 2.0 * std::acos(-1.0);
+
+            if (famKey == "oscillator") {
+                const bool vco = b.contains("frequencyControl");
+                {
+                    std::set<std::string> allowed = {"outPlus", "outMinus"};
+                    if (vco) { allowed.insert("ctrlPlus"); allowed.insert("ctrlMinus"); }
+                    check_pins(c.name, "oscillator", allowed);
+                }
+                const std::string shape = required_str("shape");
+                const double f0  = required("frequency");
+                const double amp = required("amplitude");
+                const double off = required("offset");
+                if (f0 <= 0.0)
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: oscillator '" + c.name + "' has non-positive frequency");
+                if (amp <= 0.0)
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: oscillator '" + c.name + "' has non-positive amplitude");
+                if (shape != "sawtooth" && shape != "triangle" && shape != "square" && shape != "sine")
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: oscillator '" + c.name + "' has unknown shape '" +
+                        shape + "' (expected sawtooth/triangle/square/sine)");
+                if (shape == "square" && !b.contains("dutyCycle"))
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: oscillator '" + c.name +
+                        "' behavioral block is missing required 'dutyCycle' (shape=square)");
+                if (shape != "square" && b.contains("dutyCycle"))
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: oscillator '" + c.name +
+                        "' has dutyCycle but shape is not 'square'");
+                double duty = 0.0;
+                if (shape == "square") {
+                    duty = resolved_leaf(b.at("dutyCycle"), "dutyCycle of " + c.name);
+                    if (duty <= 0.0 || duty >= 1.0)
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: oscillator '" + c.name +
+                            "' dutyCycle must lie in (0, 1)");
+                }
+                // phase: absent = the waveform origin (a documented convention of the schema,
+                // not a silent numeric default).
+                const double phase = b.contains("phase")
+                    ? resolved_leaf(b.at("phase"), "phase of " + c.name) : 0.0;
+                const std::string outP = node_of(c.name, "outPlus");
+                const std::string outM = node_of(c.name, "outMinus");
+
+                if (!vco) {
+                    // Fixed frequency -> native independent source. Span convention:
+                    // offset..offset+amplitude (saw/tri/square), offset±amplitude (sine);
+                    // phase becomes a time delay td = phase/(2*pi*f0). eps = period/1000 is
+                    // the ideal-edge realization constant of the template.
+                    const double period = 1.0 / f0;
+                    const double td  = phase / (kTwoPi * f0);
+                    const double eps = period * 1e-3;
+                    if (shape == "sine") {
+                        body << "V" << c.name << " " << outP << " " << outM << " "
+                             << (dialect == SpiceDialect::Ltspice ? "SINE(" : "SIN(")
+                             << num(off) << " " << num(amp) << " " << num(f0) << " "
+                             << num(td) << ")\n";
+                    } else {
+                        double tr, tf, pw;
+                        if (shape == "sawtooth")      { tr = period - eps; tf = eps; pw = 0.0; }
+                        else if (shape == "triangle") { tr = period / 2.0; tf = period / 2.0; pw = 0.0; }
+                        else /* square */             { tr = eps; tf = eps; pw = duty * period; }
+                        body << "V" << c.name << " " << outP << " " << outM << " PULSE("
+                             << num(off) << " " << num(off + amp) << " " << num(td) << " "
+                             << num(tr) << " " << num(tf) << " " << num(pw) << " "
+                             << num(period) << ")\n";
+                    }
+                } else {
+                    // VCO -> canonical phase-accumulator template: behavioral current source
+                    // charging a 1 F capacitor with I = f(t) = max(0, f0 + gain*v(ctrl)) (the
+                    // clamp: negative instantaneous frequency is meaningless), so V(ph) counts
+                    // elapsed CYCLES; the shaping B-source wraps it with floor(). Initial
+                    // phase enters as the capacitor IC in cycles (phase/(2*pi)).
+                    const json& fc = b.at("frequencyControl");
+                    if (!fc.contains("gain"))
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: oscillator '" + c.name +
+                            "' frequencyControl is missing required 'gain'");
+                    const double gain = resolved_leaf(fc.at("gain"), "frequencyControl.gain of " + c.name);
+                    const std::string cp = node_of(c.name, "ctrlPlus");
+                    const std::string cn = node_of(c.name, "ctrlMinus");
+                    const std::string ph = c.name + "__ph";
+                    const std::string wr = "(V(" + ph + ")-floor(V(" + ph + ")))";
+                    body << "B" << c.name << "_f 0 " << ph << " I=max(0,(" << num(f0) << ")+("
+                         << num(gain) << ")*V(" << cp << "," << cn << "))\n";
+                    body << "C" << c.name << "_ph " << ph << " 0 1 IC=" << num(phase / kTwoPi) << "\n";
+                    std::string expr;
+                    if (shape == "sawtooth")
+                        expr = "(" + num(off) + ")+(" + num(amp) + ")*" + wr;
+                    else if (shape == "triangle")
+                        expr = "(" + num(off) + ")+(" + num(amp) + ")*(1-2*abs(" + wr + "-0.5))";
+                    else if (shape == "square")
+                        expr = tern(wr + "<(" + num(duty) + ")", num(off + amp), num(off));
+                    else /* sine */
+                        expr = "(" + num(off) + ")+(" + num(amp) + ")*sin(2*pi*" + wr + ")";
+                    body << "B" << c.name << " " << outP << " " << outM << " V=" << expr << "\n";
+                }
+            }
+            else if (famKey == "latch") {
+                // Canonical self-holding template: a B-source computes the next state from
+                // set/reset and the 1 ns-RC-delayed state node itself; dominance decides the
+                // ternary NESTING order (the dominant input's check comes first). The output
+                // B-source maps state 0/1 linearly onto outputLow/outputHigh.
+                check_pins(c.name, "latch", {"setPlus", "setMinus", "resetPlus", "resetMinus",
+                                             "outPlus", "outMinus"});
+                const double sThr = required("setThreshold");
+                const double rThr = required("resetThreshold");
+                const double hi   = required("outputHigh");
+                const double lo   = required("outputLow");
+                const std::string dom = required_str("dominance");
+                if (dom != "set" && dom != "reset")
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: latch '" + c.name + "' has unknown dominance '" +
+                        dom + "' (expected set/reset)");
+                const std::string nd = c.name + "__d";
+                const std::string nq = c.name + "__q";
+                const std::string setCond = "V(" + node_of(c.name, "setPlus") + ","
+                                          + node_of(c.name, "setMinus") + ")>(" + num(sThr) + ")";
+                const std::string rstCond = "V(" + node_of(c.name, "resetPlus") + ","
+                                          + node_of(c.name, "resetMinus") + ")>(" + num(rThr) + ")";
+                const std::string hold = "V(" + nq + ")";
+                const std::string stExpr = (dom == "reset")
+                    ? tern(rstCond, "0", tern(setCond, "1", hold))    // reset checked FIRST
+                    : tern(setCond, "1", tern(rstCond, "0", hold));
+                body << "B" << c.name << "_st " << nd << " 0 V=" << stExpr << "\n";
+                body << "R" << c.name << "_st " << nd << " " << nq << " 1\n";
+                body << "C" << c.name << "_st " << nq << " 0 1n\n";
+                body << "B" << c.name << " " << node_of(c.name, "outPlus") << " "
+                     << node_of(c.name, "outMinus") << " V=(" << num(lo) << ")+((" << num(hi)
+                     << ")-(" << num(lo) << "))*V(" << nq << ")\n";
+            }
+            else { // famKey == "timer"
+                const std::string mode = required_str("mode");
+                const double hi = required("outputHigh");
+                const double lo = required("outputLow");
+                if (mode == "astable") {
+                    // Free-running rectangular output -> native PULSE between outputLow and
+                    // outputHigh (eps = period/1000, the same ideal-edge constant).
+                    check_pins(c.name, "timer", {"outPlus", "outMinus"});
+                    const double period = required("period");
+                    const double duty   = required("dutyCycle");
+                    if (period <= 0.0)
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: timer '" + c.name + "' has non-positive period");
+                    if (duty <= 0.0 || duty >= 1.0)
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: timer '" + c.name +
+                            "' dutyCycle must lie in (0, 1)");
+                    const double eps = period * 1e-3;
+                    body << "V" << c.name << " " << node_of(c.name, "outPlus") << " "
+                         << node_of(c.name, "outMinus") << " PULSE(" << num(lo) << " " << num(hi)
+                         << " 0 " << num(eps) << " " << num(eps) << " " << num(duty * period)
+                         << " " << num(period) << ")\n";
+                } else if (mode == "monostable") {
+                    // Canonical one-shot template: (1) trigger level B-source, polarity-
+                    // normalised to "active = 1"; (2) edge detector = 10 ns RC delay of the
+                    // level, edge = V(lvl)-V(lvld)>0.5 (~7 ns wide, long enough to settle the
+                    // 1 ns state RC); (3) pulse state q, self-holding like the latch; (4) time
+                    // ramp = 1 nA into 1 nF (slope 1 V/s, so V(tr) is elapsed SECONDS) with a
+                    // discharge switch, compared against onTime to end the pulse.
+                    // retriggerable=true: an edge always (re)sets q AND discharges the ramp;
+                    // retriggerable=false: edges are examined only in the idle branch and the
+                    // ramp discharges only while idle — mid-pulse triggers are ignored.
+                    check_pins(c.name, "timer", {"trgPlus", "trgMinus", "outPlus", "outMinus"});
+                    const double thr    = required("threshold");
+                    const double onTime = required("onTime");
+                    const std::string polarity = required_str("polarity");
+                    if (onTime <= 0.0)
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: timer '" + c.name + "' has non-positive onTime");
+                    if (polarity != "risingEdge" && polarity != "fallingEdge")
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: timer '" + c.name + "' has unknown polarity '" +
+                            polarity + "' (expected risingEdge/fallingEdge)");
+                    if (!b.contains("retriggerable") || !b.at("retriggerable").is_boolean())
+                        throw std::runtime_error(
+                            "CiasCircuitConverter: timeBase timer '" + c.name +
+                            "' behavioral block is missing required 'retriggerable'");
+                    const bool retrig = b.at("retriggerable").get<bool>();
+                    const std::string lvl  = c.name + "__lvl";
+                    const std::string lvld = c.name + "__lvld";
+                    const std::string nd   = c.name + "__d";
+                    const std::string nq   = c.name + "__q";
+                    const std::string tr   = c.name + "__tr";
+                    const std::string rst  = c.name + "__rst";
+                    const std::string model = "TMR_" + c.name;
+                    const std::string lvlCond = "V(" + node_of(c.name, "trgPlus") + ","
+                                              + node_of(c.name, "trgMinus") + ")"
+                                              + (polarity == "risingEdge" ? ">" : "<")
+                                              + "(" + num(thr) + ")";
+                    const std::string edge   = "V(" + lvl + ")-V(" + lvld + ")>0.5";
+                    const std::string ended  = "V(" + tr + ")>=(" + num(onTime) + ")";
+                    const std::string active = "V(" + nq + ")>0.5";
+                    const std::string idle   = "V(" + nq + ")<0.5";
+                    const std::string qExpr = retrig
+                        ? tern(edge, "1", tern(active, tern(ended, "0", "1"), "0"))
+                        : tern(active, tern(ended, "0", "1"), tern(edge, "1", "0"));
+                    const std::string rstExpr = retrig
+                        ? tern(edge, "1", tern(idle, "1", "0"))
+                        : tern(idle, "1", "0");
+                    body << "B" << c.name << "_lvl " << lvl << " 0 V=" << tern(lvlCond, "1", "0") << "\n";
+                    body << "R" << c.name << "_ed " << lvl << " " << lvld << " 10\n";
+                    body << "C" << c.name << "_ed " << lvld << " 0 1n\n";
+                    body << "B" << c.name << "_st " << nd << " 0 V=" << qExpr << "\n";
+                    body << "R" << c.name << "_st " << nd << " " << nq << " 1\n";
+                    body << "C" << c.name << "_st " << nq << " 0 1n\n";
+                    body << "B" << c.name << "_chg 0 " << tr << " I=1e-9\n";
+                    body << "C" << c.name << "_tr " << tr << " 0 1n\n";
+                    body << "B" << c.name << "_rst " << rst << " 0 V=" << rstExpr << "\n";
+                    body << "S" << c.name << "_rst " << tr << " 0 " << rst << " 0 " << model << "\n";
+                    // Vt/Vh, not Von/Voff: ngspice-42 ignores Von/Voff on SW models (comparator
+                    // precedent — the same card works in both dialects).
+                    body << ".model " << model << " SW(Vt=0.5 Vh=0.2 Ron=1 Roff=1e9)\n";
+                    body << "B" << c.name << " " << node_of(c.name, "outPlus") << " "
+                         << node_of(c.name, "outMinus") << " V=(" << num(lo) << ")+((" << num(hi)
+                         << ")-(" << num(lo) << "))*V(" << nq << ")\n";
+                } else {
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: timer '" + c.name + "' has unknown mode '" + mode +
+                        "' (expected monostable/astable)");
+                }
             }
         }
         else if (d.contains("behavioral")) {
@@ -719,7 +1032,7 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
             throw std::runtime_error(
                 "CiasCircuitConverter: component '" + c.name +
                 "' has an unknown PEAS discriminator — expected resistor/capacitor/magnetic/"
-                "semiconductor/analog/behavioral");
+                "semiconductor/analog/timeBase/behavioral");
         }
     }
     return body.str();
@@ -774,7 +1087,7 @@ std::vector<std::string> validate_cias_structure(const CiasCircuit& circuit) {
 
     static const std::vector<std::string> KNOWN = {
         "resistor", "capacitor", "magnetic", "semiconductor", "varistor",
-        "controller", "connector", "analog", "behavioral", "transmissionLine"};
+        "controller", "connector", "analog", "timeBase", "behavioral", "transmissionLine"};
     for (const auto& c : circuit.components) {
         if (c.name.empty()) problems.push_back("a component has an empty name");
         else if (!compNames.insert(c.name).second)

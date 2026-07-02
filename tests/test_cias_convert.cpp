@@ -9,9 +9,19 @@
 //   * VDMOS models get 3-node M cards; sec-sec coupling k = k_i * k_j
 //   * unknown pins / double-port nets / corrupt magnetics data throw
 
+//   * timeBase atoms (TBAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
+//     emit one canonical template each; missing behavioral fields throw
+//   * `time` passes through controlled-nature expressions unmangled (both dialects)
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include "CiasCircuitConverter.hpp"
 
 using json = nlohmann::json;
@@ -265,6 +275,330 @@ TEST_CASE("a net exposed at two ports throws", "[cias]") {
     json c = rc_circuit();
     c["connections"][0]["endpoints"].push_back({{"port", "gnd"}});
     CHECK_THROWS_WITH(emit(c), ContainsSubstring("exposed at two ports"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TBAS time-base atoms + AAS sampleHold (PEAS-RFC 0001 §7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+json time_base_atom(const std::string& family, json behavioral) {
+    return {{"timeBase", {{family, {{"behavioral", behavioral}}}}},
+            {"inputs", {{"designRequirements", json::object()}}}};
+}
+
+// Oscillator brick: pins outPlus/outMinus at ports op/om (+ ctrlPlus/ctrlMinus at cp/cm).
+json osc_circuit(json behavioral, bool vco = false) {
+    json conns = json::array({pin_port_net("n1", "OSC", "outPlus", "op"),
+                              pin_port_net("n2", "OSC", "outMinus", "om")});
+    json ports = json::array({{{"name", "op"}}, {{"name", "om"}}});
+    if (vco) {
+        ports.push_back({{"name", "cp"}});
+        ports.push_back({{"name", "cm"}});
+        conns.push_back(pin_port_net("n3", "OSC", "ctrlPlus", "cp"));
+        conns.push_back(pin_port_net("n4", "OSC", "ctrlMinus", "cm"));
+    }
+    return {{"name", "oscb"},
+            {"ports", ports},
+            {"components", json::array({{{"name", "OSC"},
+                                         {"data", time_base_atom("oscillator", behavioral)}}})},
+            {"connections", conns}};
+}
+
+json latch_circuit(json behavioral) {
+    return {{"name", "latchb"},
+            {"ports", json::array({{{"name", "sp"}}, {{"name", "sm"}}, {{"name", "rp"}},
+                                   {{"name", "rm"}}, {{"name", "op"}}, {{"name", "om"}}})},
+            {"components", json::array({{{"name", "L1"},
+                                         {"data", time_base_atom("latch", behavioral)}}})},
+            {"connections", json::array({pin_port_net("n1", "L1", "setPlus", "sp"),
+                                         pin_port_net("n2", "L1", "setMinus", "sm"),
+                                         pin_port_net("n3", "L1", "resetPlus", "rp"),
+                                         pin_port_net("n4", "L1", "resetMinus", "rm"),
+                                         pin_port_net("n5", "L1", "outPlus", "op"),
+                                         pin_port_net("n6", "L1", "outMinus", "om")})}};
+}
+
+json timer_circuit(json behavioral, bool monostable) {
+    json conns = json::array({pin_port_net("n1", "M1", "outPlus", "op"),
+                              pin_port_net("n2", "M1", "outMinus", "om")});
+    json ports = json::array({{{"name", "op"}}, {{"name", "om"}}});
+    if (monostable) {
+        ports.push_back({{"name", "tp"}});
+        ports.push_back({{"name", "tm"}});
+        conns.push_back(pin_port_net("n3", "M1", "trgPlus", "tp"));
+        conns.push_back(pin_port_net("n4", "M1", "trgMinus", "tm"));
+    }
+    return {{"name", "timerb"},
+            {"ports", ports},
+            {"components", json::array({{{"name", "M1"},
+                                         {"data", time_base_atom("timer", behavioral)}}})},
+            {"connections", conns}};
+}
+
+json samplehold_circuit(json behavioral) {
+    json sh = {{"analog", {{"sampleHold", {{"behavioral", behavioral}}}}},
+               {"inputs", {{"designRequirements", json::object()}}}};
+    return {{"name", "shb"},
+            {"ports", json::array({{{"name", "i"}}, {{"name", "t"}}, {{"name", "o"}}})},
+            {"components", json::array({{{"name", "U1"}, {"data", sh}}})},
+            {"connections", json::array({pin_port_net("n1", "U1", "in", "i"),
+                                         pin_port_net("n2", "U1", "trg", "t"),
+                                         pin_port_net("n3", "U1", "out", "o")})}};
+}
+
+} // namespace
+
+TEST_CASE("oscillator fixed sawtooth/triangle/square emit PULSE per span convention", "[cias][tbas]") {
+    // sawtooth 100 kHz, amplitude 1, offset 0: rise = T - eps, fall = eps (eps = T/1000).
+    const std::string saw = emit(osc_circuit(
+        {{"shape", "sawtooth"}, {"frequency", 100000.0}, {"amplitude", 1.0}, {"offset", 0.0}}));
+    CHECK_THAT(saw, ContainsSubstring("VOSC op om PULSE(0 1 0 9.99e-06 1e-08 0 1e-05)"));
+    // LTspice PULSE card is identical.
+    const std::string sawLt = emit(osc_circuit(
+        {{"shape", "sawtooth"}, {"frequency", 100000.0}, {"amplitude", 1.0}, {"offset", 0.0}}),
+        CIAS::CircuitSimulator::Ltspice);
+    CHECK_THAT(sawLt, ContainsSubstring("VOSC op om PULSE(0 1 0 9.99e-06 1e-08 0 1e-05)"));
+    // triangle 100 kHz, amplitude 2, offset 1 (span 1..3), phase pi/2 -> td = 2.5e-06:
+    // rise = fall = T/2.
+    const std::string tri = emit(osc_circuit(
+        {{"shape", "triangle"}, {"frequency", 100000.0}, {"amplitude", 2.0}, {"offset", 1.0},
+         {"phase", 1.5707963267948966}}));
+    CHECK_THAT(tri, ContainsSubstring("VOSC op om PULSE(1 3 2.5e-06 5e-06 5e-06 0 1e-05)"));
+    // square 100 kHz, duty 0.25: width = duty*T, edges = eps.
+    const std::string sq = emit(osc_circuit(
+        {{"shape", "square"}, {"frequency", 100000.0}, {"amplitude", 1.0}, {"offset", 0.0},
+         {"dutyCycle", 0.25}}));
+    CHECK_THAT(sq, ContainsSubstring("VOSC op om PULSE(0 1 0 1e-08 1e-08 2.5e-06 1e-05)"));
+}
+
+TEST_CASE("oscillator fixed sine emits SIN (ngspice) / SINE (LTspice), offset±amplitude", "[cias][tbas]") {
+    json b = {{"shape", "sine"}, {"frequency", 100000.0}, {"amplitude", 0.5}, {"offset", 0.5}};
+    CHECK_THAT(emit(osc_circuit(b)), ContainsSubstring("VOSC op om SIN(0.5 0.5 100000 0)"));
+    CHECK_THAT(emit(osc_circuit(b), CIAS::CircuitSimulator::Ltspice),
+               ContainsSubstring("VOSC op om SINE(0.5 0.5 100000 0)"));
+}
+
+TEST_CASE("oscillator strict fields: square needs dutyCycle, others must not carry it", "[cias][tbas]") {
+    CHECK_THROWS_WITH(emit(osc_circuit(
+        {{"shape", "square"}, {"frequency", 1e5}, {"amplitude", 1.0}, {"offset", 0.0}})),
+        ContainsSubstring("dutyCycle"));
+    CHECK_THROWS_WITH(emit(osc_circuit(
+        {{"shape", "sawtooth"}, {"frequency", 1e5}, {"amplitude", 1.0}, {"offset", 0.0},
+         {"dutyCycle", 0.5}})),
+        ContainsSubstring("shape is not 'square'"));
+    CHECK_THROWS_WITH(emit(osc_circuit(
+        {{"shape", "sawtooth"}, {"frequency", 1e5}, {"amplitude", 1.0}})),
+        ContainsSubstring("offset"));
+}
+
+TEST_CASE("timeBase datasheet-only part throws — no fabricated ideal block", "[cias][tbas]") {
+    json part = {{"timeBase", {{"oscillator", {{"manufacturerInfo", {{"name", "SiTime"}}}}}}},
+                 {"inputs", {{"designRequirements", json::object()}}}};
+    json c = {{"name", "oscb"},
+              {"ports", json::array({{{"name", "op"}}, {{"name", "om"}}})},
+              {"components", json::array({{{"name", "OSC"}, {"data", part}}})},
+              {"connections", json::array({pin_port_net("n1", "OSC", "outPlus", "op"),
+                                           pin_port_net("n2", "OSC", "outMinus", "om")})}};
+    CHECK_THROWS_WITH(emit(c), ContainsSubstring("no behavioral block"));
+}
+
+TEST_CASE("VCO emits the phase-accumulator template: 0-clamp and floor() wrap", "[cias][tbas]") {
+    json b = {{"shape", "sawtooth"}, {"frequency", 100000.0}, {"amplitude", 1.0}, {"offset", 0.0},
+              {"frequencyControl", {{"gain", 50000.0}}}};
+    const std::string net = emit(osc_circuit(b, true));
+    // Clamped instantaneous frequency charging the 1 F phase capacitor (V(ph) = cycles).
+    CHECK_THAT(net, ContainsSubstring("BOSC_f 0 OSC__ph I=max(0,(100000)+(50000)*V(cp,cm))"));
+    CHECK_THAT(net, ContainsSubstring("COSC_ph OSC__ph 0 1 IC=0"));
+    // Shaping B-source wraps the phase with floor().
+    CHECK_THAT(net, ContainsSubstring("BOSC op om V=(0)+(1)*(V(OSC__ph)-floor(V(OSC__ph)))"));
+    // Sine VCO shapes with sin(2*pi*phase); LTspice keeps the same template.
+    json bs = b; bs["shape"] = "sine";
+    CHECK_THAT(emit(osc_circuit(bs, true)), ContainsSubstring("*sin(2*pi*(V(OSC__ph)-floor(V(OSC__ph))))"));
+    const std::string lt = emit(osc_circuit(b, true), CIAS::CircuitSimulator::Ltspice);
+    CHECK_THAT(lt, ContainsSubstring("I=max(0,(100000)+(50000)*V(cp,cm))"));
+    // Missing gain throws.
+    json bad = b; bad["frequencyControl"] = json::object();
+    CHECK_THROWS_WITH(emit(osc_circuit(bad, true)), ContainsSubstring("gain"));
+}
+
+TEST_CASE("latch dominance decides the ternary nesting order", "[cias][tbas]") {
+    json b = {{"setThreshold", 2.0}, {"resetThreshold", 1.0},
+              {"outputHigh", 10.0}, {"outputLow", 0.0}, {"dominance", "reset"}};
+    const std::string rd = emit(latch_circuit(b));
+    // Reset-dominant: the RESET comparison is the OUTER ternary.
+    CHECK_THAT(rd, ContainsSubstring(
+        "BL1_st L1__d 0 V=(V(rp,rm)>(1))?(0):((V(sp,sm)>(2))?(1):(V(L1__q)))"));
+    // 1 ns RC on the state node + linear 0/1 -> outputLow/outputHigh output stage.
+    CHECK_THAT(rd, ContainsSubstring("RL1_st L1__d L1__q 1"));
+    CHECK_THAT(rd, ContainsSubstring("CL1_st L1__q 0 1n"));
+    CHECK_THAT(rd, ContainsSubstring("BL1 op om V=(0)+((10)-(0))*V(L1__q)"));
+    json bs = b; bs["dominance"] = "set";
+    CHECK_THAT(emit(latch_circuit(bs)), ContainsSubstring(
+        "BL1_st L1__d 0 V=(V(sp,sm)>(2))?(1):((V(rp,rm)>(1))?(0):(V(L1__q)))"));
+    // LTspice uses the if() idiom with the same ordering.
+    CHECK_THAT(emit(latch_circuit(b), CIAS::CircuitSimulator::Ltspice), ContainsSubstring(
+        "BL1_st L1__d 0 V=if(V(rp,rm)>(1),0,if(V(sp,sm)>(2),1,V(L1__q)))"));
+    json bad = b; bad.erase("dominance");
+    CHECK_THROWS_WITH(emit(latch_circuit(bad)), ContainsSubstring("dominance"));
+}
+
+TEST_CASE("timer astable emits PULSE between outputLow/outputHigh", "[cias][tbas]") {
+    json b = {{"mode", "astable"}, {"outputHigh", 10.0}, {"outputLow", 0.0},
+              {"period", 2e-6}, {"dutyCycle", 0.5}};
+    CHECK_THAT(emit(timer_circuit(b, false)),
+               ContainsSubstring("VM1 op om PULSE(0 10 0 2e-09 2e-09 1e-06 2e-06)"));
+    json bad = b; bad.erase("period");
+    CHECK_THROWS_WITH(emit(timer_circuit(bad, false)), ContainsSubstring("period"));
+}
+
+TEST_CASE("timer monostable: retriggerable decides edge handling and ramp reset", "[cias][tbas]") {
+    json b = {{"mode", "monostable"}, {"outputHigh", 10.0}, {"outputLow", 0.0},
+              {"threshold", 2.5}, {"polarity", "risingEdge"}, {"onTime", 5e-6},
+              {"retriggerable", false}};
+    const std::string nr = emit(timer_circuit(b, true));
+    // Trigger level, edge-detect RC, time ramp (1 V/s), discharge switch, output stage.
+    CHECK_THAT(nr, ContainsSubstring("BM1_lvl M1__lvl 0 V=(V(tp,tm)>(2.5))?(1):(0)"));
+    CHECK_THAT(nr, ContainsSubstring("RM1_ed M1__lvl M1__lvld 10"));
+    CHECK_THAT(nr, ContainsSubstring("BM1_chg 0 M1__tr I=1e-9"));
+    CHECK_THAT(nr, ContainsSubstring("CM1_tr M1__tr 0 1n"));
+    CHECK_THAT(nr, ContainsSubstring("SM1_rst M1__tr 0 M1__rst 0 TMR_M1"));
+    CHECK_THAT(nr, ContainsSubstring(".model TMR_M1 SW(Vt=0.5 Vh=0.2 Ron=1 Roff=1e9)"));
+    CHECK_THAT(nr, ContainsSubstring("BM1 op om V=(0)+((10)-(0))*V(M1__q)"));
+    // Non-retriggerable: edges only reach the IDLE branch; ramp discharges only while idle.
+    CHECK_THAT(nr, ContainsSubstring(
+        "BM1_st M1__d 0 V=(V(M1__q)>0.5)?((V(M1__tr)>=(5e-06))?(0):(1)):"
+        "((V(M1__lvl)-V(M1__lvld)>0.5)?(1):(0))"));
+    CHECK_THAT(nr, ContainsSubstring("BM1_rst M1__rst 0 V=(V(M1__q)<0.5)?(1):(0)"));
+    // Retriggerable: an edge always (re)sets the state AND discharges the ramp.
+    json br = b; br["retriggerable"] = true;
+    const std::string rt = emit(timer_circuit(br, true));
+    CHECK_THAT(rt, ContainsSubstring(
+        "BM1_st M1__d 0 V=(V(M1__lvl)-V(M1__lvld)>0.5)?(1):"
+        "((V(M1__q)>0.5)?((V(M1__tr)>=(5e-06))?(0):(1)):(0))"));
+    CHECK_THAT(rt, ContainsSubstring(
+        "BM1_rst M1__rst 0 V=(V(M1__lvl)-V(M1__lvld)>0.5)?(1):((V(M1__q)<0.5)?(1):(0))"));
+    // fallingEdge flips the level comparison.
+    json bf = b; bf["polarity"] = "fallingEdge";
+    CHECK_THAT(emit(timer_circuit(bf, true)),
+               ContainsSubstring("BM1_lvl M1__lvl 0 V=(V(tp,tm)<(2.5))?(1):(0)"));
+    // Missing retriggerable throws (the two behaviors are a real design decision).
+    json bad = b; bad.erase("retriggerable");
+    CHECK_THROWS_WITH(emit(timer_circuit(bad, true)), ContainsSubstring("retriggerable"));
+}
+
+TEST_CASE("sampleHold emits switch + 1 nF hold cap + E-buffer per mode", "[cias][tbas]") {
+    json b = {{"mode", "trackWhileActive"}, {"threshold", 2.5}, {"polarity", "activeHigh"}};
+    const std::string trk = emit(samplehold_circuit(b));
+    CHECK_THAT(trk, ContainsSubstring("BU1_ctl U1__ctl 0 V=(V(t)>(2.5))?(1):(0)"));
+    CHECK_THAT(trk, ContainsSubstring("SU1 i U1__hold U1__ctl 0 SHM_U1"));
+    CHECK_THAT(trk, ContainsSubstring("CU1_hold U1__hold 0 1n"));
+    CHECK_THAT(trk, ContainsSubstring("EU1 o 0 U1__hold 0 1"));
+    CHECK_THAT(trk, ContainsSubstring(".model SHM_U1 SW(Vt=0.5 Vh=0.2 Ron=1 Roff=1e9)"));
+    // activeLow flips the trigger comparison; LTspice uses if().
+    json bl = b; bl["polarity"] = "activeLow";
+    CHECK_THAT(emit(samplehold_circuit(bl)), ContainsSubstring("V=(V(t)<(2.5))?(1):(0)"));
+    CHECK_THAT(emit(samplehold_circuit(b), CIAS::CircuitSimulator::Ltspice),
+               ContainsSubstring("BU1_ctl U1__ctl 0 V=if(V(t)>(2.5),1,0)"));
+    // sampleOnEdge adds the edge-detect RC and gates the switch on the edge pulse.
+    json be = b; be["mode"] = "sampleOnEdge";
+    const std::string edge = emit(samplehold_circuit(be));
+    CHECK_THAT(edge, ContainsSubstring("BU1_lvl U1__lvl 0 V=(V(t)>(2.5))?(1):(0)"));
+    CHECK_THAT(edge, ContainsSubstring("RU1_ed U1__lvl U1__lvld 10"));
+    CHECK_THAT(edge, ContainsSubstring("BU1_ctl U1__ctl 0 V=(V(U1__lvl)-V(U1__lvld)>0.5)?(1):(0)"));
+    // Missing threshold throws.
+    json bad = b; bad.erase("threshold");
+    CHECK_THROWS_WITH(emit(samplehold_circuit(bad)), ContainsSubstring("threshold"));
+}
+
+TEST_CASE("controlled-nature expressions pass `time` through unmangled", "[cias][tbas]") {
+    json ctl = {{"behavioral", {{"nature", "controlled"},
+                                {"output", {{"quantity", "voltage"},
+                                            {"across", json::array({"p", "n"})},
+                                            {"expression", "0.5+0.4*sin(2*pi*50*time)"}}}}},
+                {"inputs", {{"designRequirements", json::object()}}}};
+    json c = {{"name", "tsrc"},
+              {"ports", json::array({{{"name", "p"}}, {{"name", "n"}}})},
+              {"components", json::array({{{"name", "B1"}, {"data", ctl}}})},
+              {"connections", json::array({pin_port_net("n1", "B1", "p", "p"),
+                                           pin_port_net("n2", "B1", "n", "n")})}};
+    CHECK_THAT(emit(c), ContainsSubstring("BB1 p n V=0.5+0.4*sin(2*pi*50*time)"));
+    CHECK_THAT(emit(c, CIAS::CircuitSimulator::Ltspice),
+               ContainsSubstring("BB1 p n V=0.5+0.4*sin(2*pi*50*time)"));
+}
+
+// ngspice smoke test — ngspice was on PATH when this test was written; if it has since
+// disappeared the test FAILS loudly (never silently skips) per the house rule.
+TEST_CASE("ngspice smoke: PWM duty cycle tracks the control voltage", "[cias][tbas][ngspice]") {
+    if (std::system("which ngspice > /dev/null 2>&1") != 0)
+        FAIL("ngspice not found on PATH — it was present when this smoke test was added");
+
+    // TBAS sawtooth oscillator (100 kHz, 0..1 V ramp) + AAS comparator: classic voltage-mode
+    // PWM. The comparator output is high while V(ctl) > V(ramp), so duty == vctl.
+    json osc = time_base_atom("oscillator", {{"shape", "sawtooth"}, {"frequency", 100000.0},
+                                             {"amplitude", 1.0}, {"offset", 0.0}});
+    json cmp = {{"analog", {{"comparator", {{"behavioral", {{"outputHigh", 1.0},
+                                                            {"outputLow", 0.0}}}}}}},
+                {"inputs", {{"designRequirements", json::object()}}}};
+    json c = {{"name", "pwm"},
+              {"ports", json::array()},
+              {"components", json::array({{{"name", "OSC"}, {"data", osc}},
+                                          {{"name", "CMP"}, {"data", cmp}}})},
+              {"connections", json::array({
+                  {{"name", "ramp"}, {"endpoints", json::array({
+                      {{"component", "OSC"}, {"pin", "outPlus"}},
+                      {{"component", "CMP"}, {"pin", "inMinus"}}})}},
+                  {{"name", "0"}, {"endpoints", json::array({
+                      {{"component", "OSC"}, {"pin", "outMinus"}}})}},
+                  {{"name", "ctl"}, {"endpoints", json::array({
+                      {{"component", "CMP"}, {"pin", "inPlus"}}})}},
+                  {{"name", "pwm"}, {"endpoints", json::array({
+                      {{"component", "CMP"}, {"pin", "out"}}})}}})}};
+    const std::string cards =
+        CIAS::CiasCircuitConverter(CIAS::CircuitSimulator::Ngspice)
+            .to_cards(CIAS::CiasCircuit::from_json(c));
+
+    namespace fs = std::filesystem;
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const fs::path cir = fs::temp_directory_path() / ("cias_pwm_smoke_" + tag + ".cir");
+    const fs::path log = fs::temp_directory_path() / ("cias_pwm_smoke_" + tag + ".log");
+
+    auto run_duty = [&](double vctl) -> double {
+        {
+            std::ofstream f(cir);
+            REQUIRE(f.good());
+            f << "* CIAS PWM smoke (emitted by CiasCircuitConverter)\n"
+              << "Vctl ctl 0 DC " << vctl << "\n"
+              << cards
+              << ".tran 0.01u 200u 100u\n"
+              << ".meas tran davg AVG V(pwm) from=100u to=200u\n"
+              << ".end\n";
+        }
+        const std::string cmd = "ngspice -b " + cir.string() + " > " + log.string() + " 2>&1";
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        std::ifstream lf(log);
+        std::string line;
+        while (std::getline(lf, line)) {
+            const auto pos = line.find("davg");
+            if (pos != std::string::npos) {
+                const auto eq = line.find('=', pos);
+                REQUIRE(eq != std::string::npos);
+                return std::stod(line.substr(eq + 1));
+            }
+        }
+        FAIL("ngspice produced no 'davg' measurement — deck: " + cir.string());
+        return 0.0;
+    };
+
+    // Average of a 0/1 PWM wave over whole periods IS the duty cycle. Tolerance 5%.
+    const double d25 = run_duty(0.25);
+    CHECK(std::abs(d25 - 0.25) < 0.05);
+    const double d70 = run_duty(0.70);
+    CHECK(std::abs(d70 - 0.70) < 0.05);
+    fs::remove(cir);
+    fs::remove(log);
 }
 
 TEST_CASE("structural validator flags double-port nets", "[cias]") {
