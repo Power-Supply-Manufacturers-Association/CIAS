@@ -186,54 +186,116 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     "CiasCircuitConverter: semiconductor '" + c.name +
                     "' has no diode/mosfet/igbt/bjt body");
             const json& dev = semi.at(devKey);
-            if (!dev.contains("spiceModel"))
-                throw std::runtime_error(
-                    "CiasCircuitConverter: semiconductor '" + c.name + "' (" + devKey +
-                    ") has no spiceModel to emit");
-            const json& sm = dev.at("spiceModel");
-            const std::string mtype = sm.at("modelType").get<std::string>();
-            const std::string model = "MODEL_" + c.name;
-
-            if (devKey == "diode") {
-                check_pins(c.name, "diode", {"anode", "cathode"});
-                body << "D" << c.name << " " << node_of(c.name, "anode") << " "
-                     << node_of(c.name, "cathode") << " " << model << "\n";
-            } else if (devKey == "bjt") {
-                check_pins(c.name, "bjt", {"collector", "base", "emitter"});
-                body << "Q" << c.name << " " << node_of(c.name, "collector") << " "
-                     << node_of(c.name, "base") << " " << node_of(c.name, "emitter")
-                     << " " << model << "\n";
-            } else if (devKey == "mosfet") {
-                check_pins(c.name, "mosfet", {"drain", "gate", "source"});
-                std::string mt = mtype;
-                std::transform(mt.begin(), mt.end(), mt.begin(), ::tolower);
-                body << "M" << c.name << " " << node_of(c.name, "drain") << " "
-                     << node_of(c.name, "gate") << " " << node_of(c.name, "source");
-                // VDMOS (the LTspice power-FET model, supported by ngspice too) is a
-                // 3-terminal model: a 4th (bulk) node makes the card invalid.
-                if (mt != "vdmos")
-                    body << " " << node_of(c.name, "source");
-                body << " " << model << "\n";
-            } else {
-                throw std::runtime_error(
-                    "CiasCircuitConverter: IGBT primitive emit not supported for '" + c.name + "'");
-            }
-
-            body << ".model " << model << " " << mtype;
-            if (sm.contains("parameters") && sm.at("parameters").is_object()
-                && !sm.at("parameters").empty()) {
-                body << "(";
-                for (auto it = sm.at("parameters").begin(); it != sm.at("parameters").end(); ++it) {
-                    const json& val = it.value();
-                    body << it.key() << "=";
-                    if (val.is_number()) body << num(val.get<double>());
-                    else if (val.is_string()) body << val.get<std::string>();
-                    else body << val.dump();
-                    body << " ";
+            if (!dev.contains("spiceModel")) {
+                // NO spiceModel → build the SPICE model from the device's electrical block (the ron/
+                // vth/Vf SAS carries for an ideal OR a requirements-realized part), NOT from a per-part
+                // SPICE .model card. The whole point of CIAS is to render circuits that need not carry
+                // vendor models: an ideal switch emits MKF's canonical S-model; a realized part emits
+                // the SAME S/D template parameterized by its resolved on-resistance / forward voltage.
+                // Only when a field is truly absent do we fall back to the ideal constant (a switch's
+                // canonical model is a realization constant, not fabricated datasheet data). A REAL
+                // vendor part carries a spiceModel and takes the faithful-.model path below.
+                const json* elec = nullptr;
+                if (dev.contains("manufacturerInfo") && dev.at("manufacturerInfo").is_object()
+                    && dev.at("manufacturerInfo").contains("datasheetInfo")
+                    && dev.at("manufacturerInfo").at("datasheetInfo").is_object()
+                    && dev.at("manufacturerInfo").at("datasheetInfo").contains("electrical"))
+                    elec = &dev.at("manufacturerInfo").at("datasheetInfo").at("electrical");
+                auto optnum = [&](const char* key) -> std::optional<double> {
+                    if (!elec || !elec->contains(key)) return std::nullopt;
+                    try { return PEAS::resolve_dimensional_values(elec->at(key)); }
+                    catch (const std::exception&) { return std::nullopt; }
+                };
+                if (devKey == "mosfet") {
+                    check_pins(c.name, "mosfet", {"drain", "gate", "source"});
+                    // Resolved on-resistance / gate threshold, else MKF's ideal switch constants.
+                    const double ron = optnum("onResistance").value_or(0.01);
+                    const double vth = optnum("gateThresholdVoltage").value_or(2.5);
+                    const std::string model = "SW_" + c.name;
+                    // vc-switch: Sxxx n+ n- nc+ nc- model. Control is gate-to-GROUND (MKF's
+                    // ground-referenced pwm_ctrl), independent of the power path — so a HIGH-SIDE
+                    // switch (buck etc.) works too; for a low-side switch source==0, so it's identical.
+                    body << "S" << c.name << " " << node_of(c.name, "drain") << " "
+                         << node_of(c.name, "source") << " " << node_of(c.name, "gate") << " 0 "
+                         << model << "\n";
+                    body << ".model " << model << " SW(Vt=" << num(vth) << " Vh=0.5 Ron="
+                         << num(ron) << " Roff=1e6)\n";
+                } else if (devKey == "diode") {
+                    check_pins(c.name, "diode", {"anode", "cathode"});
+                    const std::string model = "D_" + c.name;
+                    body << "D" << c.name << " " << node_of(c.name, "anode") << " "
+                         << node_of(c.name, "cathode") << " " << model << "\n";
+                    // Saturation current so the forward drop ≈ Vf at its rated current (single
+                    // exponential, N=1): IS = i0·exp(-Vf/Vt). Ideal diode (Vf=0.8334 @ 1 A) ⇒
+                    // IS=1e-14 = MKF DIDEAL; a realized part uses its resolved Vf plus any parasitics.
+                    // No forwardVoltage at all ⇒ the canonical DIDEAL constant directly.
+                    if (auto vf = optnum("forwardVoltage")) {
+                        const double Vt = 0.025852;   // ngspice 27 °C thermal voltage
+                        const double i0 = optnum("forwardVoltageAt").value_or(1.0);
+                        const double isat = i0 * std::exp(-*vf / Vt);
+                        std::ostringstream m;
+                        m << ".model " << model << " D(IS=" << num(isat) << " N=1 RS=1e-6";
+                        if (auto cj  = optnum("junctionCapacitance")) m << " CJO=" << num(*cj);
+                        if (auto trr = optnum("reverseRecoveryTime"))  m << " TT="  << num(*trr);
+                        if (auto bv  = optnum("breakdownVoltage"))     m << " BV="  << num(*bv);
+                        else if (auto rv = optnum("reverseVoltage"))   m << " BV="  << num(*rv);
+                        m << ")";
+                        body << m.str() << "\n";
+                    } else {
+                        body << ".model " << model << " D(IS=1e-14 N=1 RS=1e-6)\n";
+                    }
+                } else {
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: model-less emission for '" + c.name + "' (" + devKey +
+                        ") is not supported — only mosfet/diode have an ideal realization; a bjt/igbt "
+                        "must carry a spiceModel");
                 }
-                body << ")";
+            } else {
+                const json& sm = dev.at("spiceModel");
+                const std::string mtype = sm.at("modelType").get<std::string>();
+                const std::string model = "MODEL_" + c.name;
+
+                if (devKey == "diode") {
+                    check_pins(c.name, "diode", {"anode", "cathode"});
+                    body << "D" << c.name << " " << node_of(c.name, "anode") << " "
+                         << node_of(c.name, "cathode") << " " << model << "\n";
+                } else if (devKey == "bjt") {
+                    check_pins(c.name, "bjt", {"collector", "base", "emitter"});
+                    body << "Q" << c.name << " " << node_of(c.name, "collector") << " "
+                         << node_of(c.name, "base") << " " << node_of(c.name, "emitter")
+                         << " " << model << "\n";
+                } else if (devKey == "mosfet") {
+                    check_pins(c.name, "mosfet", {"drain", "gate", "source"});
+                    std::string mt = mtype;
+                    std::transform(mt.begin(), mt.end(), mt.begin(), ::tolower);
+                    body << "M" << c.name << " " << node_of(c.name, "drain") << " "
+                         << node_of(c.name, "gate") << " " << node_of(c.name, "source");
+                    // VDMOS (the LTspice power-FET model, supported by ngspice too) is a
+                    // 3-terminal model: a 4th (bulk) node makes the card invalid.
+                    if (mt != "vdmos")
+                        body << " " << node_of(c.name, "source");
+                    body << " " << model << "\n";
+                } else {
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: IGBT primitive emit not supported for '" + c.name + "'");
+                }
+
+                body << ".model " << model << " " << mtype;
+                if (sm.contains("parameters") && sm.at("parameters").is_object()
+                    && !sm.at("parameters").empty()) {
+                    body << "(";
+                    for (auto it = sm.at("parameters").begin(); it != sm.at("parameters").end(); ++it) {
+                        const json& val = it.value();
+                        body << it.key() << "=";
+                        if (val.is_number()) body << num(val.get<double>());
+                        else if (val.is_string()) body << val.get<std::string>();
+                        else body << val.dump();
+                        body << " ";
+                    }
+                    body << ")";
+                }
+                body << "\n";
             }
-            body << "\n";
         }
         else if (d.contains("magnetic")) {
             const json& mag = d.at("magnetic");
@@ -321,7 +383,10 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                         // sec-sec coupling goes through the shared primary path: k_ij = k_i*k_j.
                         double kij = (i == 0) ? kToPri[j] : kToPri[i] * kToPri[j];
                         double kEmit = (dialect == SpiceDialect::Ltspice) ? kij : std::min(kij, 0.999999);
-                        body << "K" << c.name << "_" << i << "_" << j << " " << indNames[i] << " "
+                        // Mutual-coupling name keeps the established "<name>_<ij>" deck format (winding
+                        // indices concatenated), e.g. KT1_01 for the primary↔secondary1 pair — the
+                        // stable contract Kirchhoff's decks and equivalence tests are written against.
+                        body << "K" << c.name << "_" << i << j << " " << indNames[i] << " "
                              << indNames[j] << " " << num(kEmit) << "\n";
                     }
             }
