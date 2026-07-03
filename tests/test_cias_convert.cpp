@@ -9,7 +9,7 @@
 //   * VDMOS models get 3-node M cards; sec-sec coupling k = k_i * k_j
 //   * unknown pins / double-port nets / corrupt magnetics data throw
 
-//   * timeBase atoms (TBAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
+//   * timeBase atoms (TDAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
 //     emit one canonical template each; missing behavioral fields throw
 //   * `time` passes through controlled-nature expressions unmangled (both dialects)
 
@@ -278,7 +278,7 @@ TEST_CASE("a net exposed at two ports throws", "[cias]") {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TBAS time-base atoms + AAS sampleHold (PEAS-RFC 0001 §7)
+// TDAS time-base atoms + AAS sampleHold (PEAS-RFC 0001 §7)
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -534,7 +534,7 @@ TEST_CASE("ngspice smoke: PWM duty cycle tracks the control voltage", "[cias][tb
     if (std::system("which ngspice > /dev/null 2>&1") != 0)
         FAIL("ngspice not found on PATH — it was present when this smoke test was added");
 
-    // TBAS sawtooth oscillator (100 kHz, 0..1 V ramp) + AAS comparator: classic voltage-mode
+    // TDAS sawtooth oscillator (100 kHz, 0..1 V ramp) + AAS comparator: classic voltage-mode
     // PWM. The comparator output is high while V(ctl) > V(ramp), so duty == vctl.
     json osc = time_base_atom("oscillator", {{"shape", "sawtooth"}, {"frequency", 100000.0},
                                              {"amplitude", 1.0}, {"offset", 0.0}});

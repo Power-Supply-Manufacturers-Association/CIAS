@@ -5,7 +5,7 @@
 // Supported targets:
 //   Ngspice / Ltspice — PEAS-atom rendering (resistor / capacitor / magnetic / semiconductor /
 //                       analog / timeBase / behavioral discriminators). The timeBase atoms
-//                       (TBAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
+//                       (TDAS oscillator/timer/latch, PEAS-RFC 0001 §7) and the AAS sampleHold
 //                       emit one canonical template each: fixed oscillators / astable timers as
 //                       native PULSE/SIN(E) sources, VCOs as a phase-accumulator (clamped
 //                       B-current into 1 F + floor()-wrap shaping B-source), latches and

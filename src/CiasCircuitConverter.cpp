@@ -503,7 +503,7 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
             }
         }
         else if (d.contains("timeBase")) {
-            // TBAS time-base atoms (PEAS-RFC 0001 §7): oscillator / timer / latch. Realization
+            // TDAS time-base atoms (PEAS-RFC 0001 §7): oscillator / timer / latch. Realization
             // requires the family's `behavioral` block — a datasheet-only orderable part must
             // NOT silently become a fabricated ideal block (no-fallbacks rule). Each canonical
             // subcircuit below is ONE template; only parameter values vary per call.
