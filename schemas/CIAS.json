@@ -24,6 +24,10 @@
     "connections": {
       "type": "array",
       "items": { "$ref": "#/$defs/connection" }
+    },
+    "provenance": {
+      "description": "Optional data-provenance trail for the brick as a whole (approved 2026-08, ABT #479). A DERIVED brick — one generated from a model rather than transcribed from a schematic (e.g. the connector pin-field parasitic bricks: source='derived' + a derivation string stating the closed forms, assumptions and validity band) — records its origin here. Hand-authored bricks may omit it. This is the correct home for a generated brick's rationale; it does not belong in a port description.",
+      "$ref": "https://psma.com/peas/utils.json#/$defs/provenance"
     }
   },
 
