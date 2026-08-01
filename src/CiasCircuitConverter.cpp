@@ -1108,6 +1108,130 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                     body << "H" << c.name << " " << ni << " " << pe << " " << vc << " 1\n";
                 }
             }
+            else if (nature == "coupledInductors") {
+                // N coupled windings defined by a full N x N inductance matrix [H]. Winding i
+                // (1-based, matrix row order) exposes pins winding<i>_start / winding<i>_end.
+                // Emission: one inductor per winding (L<name>_<i>, value L_ii) + pairwise
+                // K<name>_<i>_<j> cards with k_ij = M_ij/sqrt(L_ii*L_jj) for every i<j with
+                // M_ij != 0; an optional per-winding seriesResistance lowers to a series R
+                // through an internal node. Validation is strict (no clamping): the matrix
+                // must be square, symmetric within 1e-9 relative, diagonal > 0, |k_ij| <= 1.
+                const json& lm = beh.at("inductanceMatrix");
+                if (!lm.is_array() || lm.empty())
+                    throw std::invalid_argument(
+                        "CiasCircuitConverter: coupledInductors '" + c.name +
+                        "' inductanceMatrix must be a non-empty array of rows");
+                const size_t n = lm.size();
+                std::vector<std::vector<double>> M(n);
+                for (size_t i = 0; i < n; ++i) {
+                    if (!lm[i].is_array() || lm[i].size() != n)
+                        throw std::invalid_argument(
+                            "CiasCircuitConverter: coupledInductors '" + c.name +
+                            "' inductanceMatrix is not square: row " + std::to_string(i + 1) +
+                            " has " + std::to_string(lm[i].is_array() ? lm[i].size() : 0) +
+                            " entries (expected " + std::to_string(n) + ")");
+                    for (size_t j = 0; j < n; ++j) {
+                        if (!lm[i][j].is_number())
+                            throw std::invalid_argument(
+                                "CiasCircuitConverter: coupledInductors '" + c.name +
+                                "' inductanceMatrix[" + std::to_string(i + 1) + "][" +
+                                std::to_string(j + 1) + "] is not a number");
+                        M[i].push_back(lm[i][j].get<double>());
+                    }
+                }
+                for (size_t i = 0; i < n; ++i)
+                    if (M[i][i] <= 0.0)
+                        throw std::invalid_argument(
+                            "CiasCircuitConverter: coupledInductors '" + c.name +
+                            "' has non-positive self inductance L_" + std::to_string(i + 1) +
+                            "_" + std::to_string(i + 1) + " = " + num(M[i][i]) + " H");
+                for (size_t i = 0; i < n; ++i)
+                    for (size_t j = i + 1; j < n; ++j) {
+                        const double scale = std::max(std::abs(M[i][j]), std::abs(M[j][i]));
+                        if (scale > 0.0 && std::abs(M[i][j] - M[j][i]) > 1e-9 * scale)
+                            throw std::invalid_argument(
+                                "CiasCircuitConverter: coupledInductors '" + c.name +
+                                "' inductanceMatrix is asymmetric: M_" + std::to_string(i + 1) +
+                                "_" + std::to_string(j + 1) + " = " + num(M[i][j]) + " but M_" +
+                                std::to_string(j + 1) + "_" + std::to_string(i + 1) + " = " +
+                                num(M[j][i]) + " (relative difference exceeds 1e-9)");
+                        const double kij = M[i][j] / std::sqrt(M[i][i] * M[j][j]);
+                        if (std::abs(kij) > 1.0)
+                            throw std::invalid_argument(
+                                "CiasCircuitConverter: coupledInductors '" + c.name +
+                                "' has unphysical coupling |k_" + std::to_string(i + 1) + "_" +
+                                std::to_string(j + 1) + "| = " + num(std::abs(kij)) +
+                                " > 1 (M_ij exceeds sqrt(L_ii*L_jj)) — corrupt data, refusing "
+                                "to clamp");
+                    }
+                std::vector<double> rs;
+                if (beh.contains("seriesResistance")) {
+                    const json& sr = beh.at("seriesResistance");
+                    if (!sr.is_array() || sr.size() != n)
+                        throw std::invalid_argument(
+                            "CiasCircuitConverter: coupledInductors '" + c.name +
+                            "' seriesResistance has " +
+                            std::to_string(sr.is_array() ? sr.size() : 0) +
+                            " entries but the inductanceMatrix defines " + std::to_string(n) +
+                            " windings");
+                    for (size_t i = 0; i < n; ++i) {
+                        if (!sr[i].is_number())
+                            throw std::invalid_argument(
+                                "CiasCircuitConverter: coupledInductors '" + c.name +
+                                "' seriesResistance[" + std::to_string(i + 1) +
+                                "] is not a number");
+                        const double r = sr[i].get<double>();
+                        if (r < 0.0)
+                            throw std::invalid_argument(
+                                "CiasCircuitConverter: coupledInductors '" + c.name +
+                                "' has negative seriesResistance[" + std::to_string(i + 1) +
+                                "] = " + num(r) + " Ohm");
+                        rs.push_back(r);
+                    }
+                }
+                {
+                    std::set<std::string> allowed;
+                    for (size_t i = 1; i <= n; ++i) {
+                        allowed.insert("winding" + std::to_string(i) + "_start");
+                        allowed.insert("winding" + std::to_string(i) + "_end");
+                    }
+                    check_pins(c.name, "behavioral coupledInductors", allowed);
+                }
+                std::vector<std::string> indNames;
+                for (size_t i = 0; i < n; ++i) {
+                    const std::string idx = std::to_string(i + 1);
+                    const std::string nStart = node_of(c.name, "winding" + idx + "_start");
+                    const std::string nEnd   = node_of(c.name, "winding" + idx + "_end");
+                    std::string lTop = nStart;
+                    if (!rs.empty()) {
+                        // Series winding resistance through an internal node. A 0 Ohm entry
+                        // maps to the same negligible-value realization as the 0-ohm resistor
+                        // atom (LTspice rejects R=0), not a data default.
+                        const std::string nInt = c.name + "__w" + idx;
+                        double r = rs[i];
+                        if (r == 0.0) r = 1e-12;
+                        body << "R" << c.name << "_" << idx << " " << nStart << " " << nInt
+                             << " " << num(r) << "\n";
+                        lTop = nInt;
+                    }
+                    const std::string lname = "L" + c.name + "_" + idx;
+                    body << lname << " " << lTop << " " << nEnd << " " << num(M[i][i]) << "\n";
+                    indNames.push_back(lname);
+                }
+                for (size_t i = 0; i < n; ++i)
+                    for (size_t j = i + 1; j < n; ++j) {
+                        if (M[i][j] == 0.0) continue;
+                        const double kij = M[i][j] / std::sqrt(M[i][i] * M[j][j]);
+                        // ngspice cannot solve |k| == 1 (singular mutual matrix): cap the
+                        // EMITTED value just below unity — the same documented simulator
+                        // workaround as the magnetic branch, never applied to the data.
+                        const double kEmit = (dialect == SpiceDialect::Ltspice)
+                            ? kij
+                            : std::max(-0.999999, std::min(kij, 0.999999));
+                        body << "K" << c.name << "_" << (i + 1) << "_" << (j + 1) << " "
+                             << indNames[i] << " " << indNames[j] << " " << num(kEmit) << "\n";
+                    }
+            }
             else if (nature == "frequencyResponse") {
                 // Tabulated transfer function H(f): SPICE E (voltage) / G (current) FREQ list.
                 // Stored magnitude is linear, phase is radians -> emit MAG (linear) with phase
@@ -1132,7 +1256,7 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 throw std::runtime_error(
                     "CiasCircuitConverter: behavioral component '" + c.name +
                     "' has unknown nature '" + nature +
-                    "' — expected flux/charge/chan/controlled/source/switch/frequencyResponse");
+                    "' — expected flux/charge/chan/controlled/source/switch/frequencyResponse/coupledInductors");
             }
         }
         else if (d.contains("transmissionLine")) {

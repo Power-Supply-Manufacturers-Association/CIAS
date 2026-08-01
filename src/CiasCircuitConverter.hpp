@@ -11,6 +11,11 @@
 //                       B-current into 1 F + floor()-wrap shaping B-source), latches and
 //                       monostable timers as self-holding B-source state nodes with 1 ns RCs,
 //                       sample/holds as ideal switch + 1 nF hold cap + E-buffer.
+//                       The behavioral coupledInductors nature (N-winding inductance matrix)
+//                       lowers to one L card per winding + pairwise K cards with
+//                       k_ij = M_ij/sqrt(L_ii*L_jj); matrix validation is strict (square,
+//                       symmetric within 1e-9 relative, diagonal > 0, |k| <= 1 — throws
+//                       std::invalid_argument, never clamps).
 //                       The two dialects differ in:
 //                       behavioral ternary ((c)?(a):(b) vs if(c,a,b)), flux/charge realization
 //                       (B+ddt()+sense vs native Flux=/Q= attributes), Chan core (closed-form

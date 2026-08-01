@@ -265,6 +265,109 @@ TEST_CASE("magnetic: sec-sec coupling is k_i*k_j and corrupt leakage throws", "[
     CHECK_THROWS_WITH(emit(circ(bad)), ContainsSubstring("leakage inductance >= magnetizing"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// behavioral coupledInductors — N-winding inductance matrix -> L + K cards
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Brick with one coupledInductors component 'PF' whose winding pins are exposed at
+// ports a1/b1, a2/b2, ... (winding<i>_start -> a<i>, winding<i>_end -> b<i>).
+json coupled_circuit(json matrix, json seriesResistance = nullptr) {
+    json beh = {{"nature", "coupledInductors"}, {"inductanceMatrix", matrix}};
+    if (!seriesResistance.is_null()) beh["seriesResistance"] = seriesResistance;
+    json comp = {{"behavioral", beh},
+                 {"inputs", {{"designRequirements", json::object()}}}};
+    const size_t n = matrix.size();
+    json ports = json::array();
+    json conns = json::array();
+    for (size_t i = 1; i <= n; ++i) {
+        const std::string idx = std::to_string(i);
+        ports.push_back({{"name", "a" + idx}});
+        ports.push_back({{"name", "b" + idx}});
+        conns.push_back(pin_port_net("na" + idx, "PF", "winding" + idx + "_start", "a" + idx));
+        conns.push_back(pin_port_net("nb" + idx, "PF", "winding" + idx + "_end", "b" + idx));
+    }
+    return {{"name", "pinfield"},
+            {"ports", ports},
+            {"components", json::array({{{"name", "PF"}, {"data", comp}}})},
+            {"connections", conns}};
+}
+
+} // namespace
+
+TEST_CASE("coupledInductors 2-winding: L cards + hand-computed k", "[cias][coupled]") {
+    // k12 = 20n / sqrt(100n * 50n) = 20/sqrt(5000) = 0.2828427125 (10 significant digits).
+    const json m = {{100e-9, 20e-9}, {20e-9, 50e-9}};
+    const std::string net = emit(coupled_circuit(m));
+    CHECK_THAT(net, ContainsSubstring("LPF_1 a1 b1 1e-07"));
+    CHECK_THAT(net, ContainsSubstring("LPF_2 a2 b2 5e-08"));
+    CHECK_THAT(net, ContainsSubstring("KPF_1_2 LPF_1 LPF_2 0.2828427125"));
+    // LTspice: identical cards for |k| < 1.
+    const std::string lt = emit(coupled_circuit(m), CIAS::CircuitSimulator::Ltspice);
+    CHECK_THAT(lt, ContainsSubstring("KPF_1_2 LPF_1 LPF_2 0.2828427125"));
+}
+
+TEST_CASE("coupledInductors 3-winding: seriesResistance nodes, k values, M=0 pair skipped",
+          "[cias][coupled]") {
+    // k12 = 30n/sqrt(100n*400n) = 30/200 = 0.15; k23 = 60n/sqrt(400n*900n) = 60/600 = 0.1;
+    // M13 = 0 -> no K card for the 1-3 pair.
+    const json m = {{100e-9, 30e-9, 0.0}, {30e-9, 400e-9, 60e-9}, {0.0, 60e-9, 900e-9}};
+    const std::string net = emit(coupled_circuit(m, {0.003, 0.005, 0.0}));
+    CHECK_THAT(net, ContainsSubstring("RPF_1 a1 PF__w1 0.003"));
+    CHECK_THAT(net, ContainsSubstring("LPF_1 PF__w1 b1 1e-07"));
+    CHECK_THAT(net, ContainsSubstring("RPF_2 a2 PF__w2 0.005"));
+    CHECK_THAT(net, ContainsSubstring("LPF_2 PF__w2 b2 4e-07"));
+    // 0 Ohm entry -> the documented negligible-value realization (same as the 0-ohm resistor).
+    CHECK_THAT(net, ContainsSubstring("RPF_3 a3 PF__w3 1e-12"));
+    CHECK_THAT(net, ContainsSubstring("LPF_3 PF__w3 b3 9e-07"));
+    CHECK_THAT(net, ContainsSubstring("KPF_1_2 LPF_1 LPF_2 0.15"));
+    CHECK_THAT(net, ContainsSubstring("KPF_2_3 LPF_2 LPF_3 0.1"));
+    CHECK(net.find("KPF_1_3") == std::string::npos);
+}
+
+TEST_CASE("coupledInductors k == 1: ngspice caps the EMITTED value, LTspice does not",
+          "[cias][coupled]") {
+    // M12 = sqrt(L11*L22) exactly -> k = 1: valid data, but ngspice cannot solve k == 1.
+    const json m = {{100e-9, 100e-9}, {100e-9, 100e-9}};
+    CHECK_THAT(emit(coupled_circuit(m)),
+               ContainsSubstring("KPF_1_2 LPF_1 LPF_2 0.999999"));
+    CHECK_THAT(emit(coupled_circuit(m), CIAS::CircuitSimulator::Ltspice),
+               ContainsSubstring("KPF_1_2 LPF_1 LPF_2 1"));
+}
+
+TEST_CASE("coupledInductors strict validation throws std::invalid_argument", "[cias][coupled]") {
+    // Asymmetric matrix (beyond 1e-9 relative).
+    CHECK_THROWS_AS(emit(coupled_circuit({{100e-9, 20e-9}, {21e-9, 50e-9}})),
+                    std::invalid_argument);
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 20e-9}, {21e-9, 50e-9}})),
+                      ContainsSubstring("asymmetric"));
+    // |k| > 1: M12 = 80n > sqrt(100n*50n) = 70.7n.
+    CHECK_THROWS_AS(emit(coupled_circuit({{100e-9, 80e-9}, {80e-9, 50e-9}})),
+                    std::invalid_argument);
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 80e-9}, {80e-9, 50e-9}})),
+                      ContainsSubstring("unphysical coupling"));
+    // Negative / zero diagonal.
+    CHECK_THROWS_AS(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9, -50e-9}})),
+                    std::invalid_argument);
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9, -50e-9}})),
+                      ContainsSubstring("non-positive self inductance"));
+    CHECK_THROWS_WITH(emit(coupled_circuit({{0.0}})),
+                      ContainsSubstring("non-positive self inductance"));
+    // Non-square matrix.
+    CHECK_THROWS_AS(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9}})),
+                    std::invalid_argument);
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9}})),
+                      ContainsSubstring("not square"));
+    // seriesResistance length mismatch / negative value.
+    CHECK_THROWS_AS(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9, 50e-9}}, {0.003})),
+                    std::invalid_argument);
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9, 50e-9}}, {0.003})),
+                      ContainsSubstring("seriesResistance has 1 entries"));
+    CHECK_THROWS_WITH(emit(coupled_circuit({{100e-9, 20e-9}, {20e-9, 50e-9}}, {0.003, -0.1})),
+                      ContainsSubstring("negative seriesResistance"));
+}
+
 TEST_CASE("unknown pin name in a connection throws instead of floating silently", "[cias]") {
     json c = rc_circuit();
     c["connections"][0]["endpoints"][0]["pin"] = "gat";  // typo
