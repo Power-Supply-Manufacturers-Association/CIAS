@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 
 build/
+build-py/
 build-wasm/
 cmake-build-*/
 *.o
