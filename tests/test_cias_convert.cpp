@@ -712,3 +712,125 @@ TEST_CASE("structural validator flags double-port nets", "[cias]") {
     for (const auto& p : problems) found |= p.find("exposed at 2 ports") != std::string::npos;
     CHECK(found);
 }
+
+// ---------------------------------------------------------------------------
+// ABT #540 — two drifts between this library and the schemas it mirrors.
+// Both were found by review, confirmed by direct test, and are pinned here so
+// they cannot come back.
+// ---------------------------------------------------------------------------
+
+// Locate PEAS/schemas/peas.json relative to this repo. Returns an empty path if the
+// sibling checkout is absent, so the test SKIPS loudly rather than silently passing.
+static std::filesystem::path peas_schema_path() {
+    for (const char* rel : {"../PEAS/schemas/peas.json", "../../PEAS/schemas/peas.json",
+                            "PEAS/schemas/peas.json"}) {
+        std::filesystem::path p(rel);
+        if (std::filesystem::exists(p)) return p;
+    }
+    return {};
+}
+
+TEST_CASE("validate_cias_structure knows every PEAS discriminator", "[cias][drift]") {
+    // The KNOWN list in validate_cias_structure must mirror peas.json's top-level oneOf.
+    // It did not: 'thermistor' was absent, so a valid inline PEAS thermistor came back as
+    // "0 discriminators (expected exactly 1)". That list decides whether a component is
+    // well-formed, and TAS's changed_records_gate now runs it over every brick in the
+    // catalogue, so a gap in it is a gate reporting a defect that does not exist.
+    const std::filesystem::path ps = peas_schema_path();
+    if (ps.empty()) {
+        WARN("PEAS/schemas/peas.json not found next to this checkout — drift test skipped");
+        return;
+    }
+    std::ifstream in(ps);
+    REQUIRE(in);
+    json peas = json::parse(in);
+
+    std::vector<std::string> discriminators;
+    for (const auto& branch : peas.at("oneOf"))
+        for (const auto& req : branch.at("required"))
+            if (req.get<std::string>() != "inputs") discriminators.push_back(req.get<std::string>());
+    REQUIRE(discriminators.size() >= 10);
+
+    // Every PEAS discriminator must survive structural validation on a minimal brick.
+    for (const std::string& d : discriminators) {
+        json brick = json::parse(R"json({"name":"drift","ports":[{"name":"a"},{"name":"b"}],
+          "components":[{"name":"X1","data":{"inputs":{"designRequirements":{"name":"x"}}}}],
+          "connections":[
+            {"name":"n1","endpoints":[{"component":"X1","pin":"1"},{"port":"a"}]},
+            {"name":"n2","endpoints":[{"component":"X1","pin":"2"},{"port":"b"}]}]})json");
+        brick["components"][0]["data"][d] = json::object();
+        const auto problems =
+            CIAS::validate_cias_structure(CIAS::CiasCircuit::from_json(brick));
+        INFO("PEAS discriminator '" << d << "' rejected by validate_cias_structure");
+        CHECK(problems.empty());
+    }
+}
+
+TEST_CASE("the component data oneOf stays disjoint", "[cias][drift]") {
+    // CIAS.json's `data` is oneOf[ PEAS document | URI string ] with NO const
+    // discriminator. That is safe only because peas.json pins a top-level object type, so
+    // a string can never satisfy the PEAS branch. If PEAS ever drops that pin, every
+    // URI-form component in the catalogue starts failing oneOf — silently, at load time,
+    // far from the change that caused it. Pin the assumption here.
+    const std::filesystem::path ps = peas_schema_path();
+    if (ps.empty()) {
+        WARN("PEAS/schemas/peas.json not found next to this checkout — disjointness test skipped");
+        return;
+    }
+    std::ifstream in(ps);
+    REQUIRE(in);
+    json peas = json::parse(in);
+    REQUIRE(peas.contains("type"));
+    CHECK(peas.at("type").get<std::string>() == "object");
+}
+
+TEST_CASE("a brick round-trips its provenance", "[cias][provenance]") {
+    // CiasCircuit had no provenance member, so from_json -> to_json SILENTLY dropped the
+    // field. 7,554 connector pin-field bricks carry it, and for a derived artifact it is
+    // the entire assumption record.
+    json brick = json::parse(R"json({"name":"p","ports":[{"name":"a"},{"name":"b"}],
+      "components":[{"name":"R1","data":{"resistor":{},
+        "inputs":{"designRequirements":{"resistance":{"nominal":50}}}}}],
+      "connections":[
+        {"name":"n1","endpoints":[{"component":"R1","pin":"1"},{"port":"a"}]},
+        {"name":"n2","endpoints":[{"component":"R1","pin":"2"},{"port":"b"}]}],
+      "provenance":[{"source":"derived","sourceName":"gen.py","retrievedDate":"2026-08-02",
+                     "derivation":"L_ii = (mu0*l/2pi)*(ln(2l/r)-1)"}]})json");
+
+    const json out = CIAS::CiasCircuit::from_json(brick).to_json();
+    REQUIRE(out.contains("provenance"));
+    CHECK(out["provenance"] == brick["provenance"]);
+    CHECK(out["provenance"][0]["derivation"].get<std::string>()
+              == "L_ii = (mu0*l/2pi)*(ln(2l/r)-1)");
+}
+
+TEST_CASE("a brick without provenance does not grow a null one", "[cias][provenance]") {
+    // Emitting an explicit null would turn "no trail" into "the trail is null", and
+    // CIAS.json has no default for the field.
+    json brick = json::parse(R"json({"name":"q","ports":[{"name":"a"},{"name":"b"}],
+      "components":[{"name":"R1","data":{"resistor":{},
+        "inputs":{"designRequirements":{"resistance":{"nominal":50}}}}}],
+      "connections":[
+        {"name":"n1","endpoints":[{"component":"R1","pin":"1"},{"port":"a"}]},
+        {"name":"n2","endpoints":[{"component":"R1","pin":"2"},{"port":"b"}]}]})json");
+    const json out = CIAS::CiasCircuit::from_json(brick).to_json();
+    CHECK_FALSE(out.contains("provenance"));
+}
+
+TEST_CASE("an unresolved catalogue URI says so, and names itself", "[cias][uri]") {
+    // Legal CIAS, not corruption: it simply has to be resolved before emission. The old
+    // message ("has no PEAS data object") read like the brick was broken.
+    json brick = json::parse(R"json({"name":"u","ports":[{"name":"a"},{"name":"b"}],
+      "components":[{"name":"Qh","data":"TAS/data/mosfets.ndjson?partNumber=C3M0032120K"}],
+      "connections":[
+        {"name":"n1","endpoints":[{"component":"Qh","pin":"drain"},{"port":"a"}]},
+        {"name":"n2","endpoints":[{"component":"Qh","pin":"source"},{"port":"b"}]}]})json");
+
+    // structurally fine — a URI component is a legal placement
+    CHECK(CIAS::validate_cias_structure(CIAS::CiasCircuit::from_json(brick)).empty());
+
+    CIAS::CiasCircuitConverter conv(CIAS::CircuitSimulator::Ngspice);
+    REQUIRE_THROWS_WITH(conv.to_subckt_json(brick),
+                        Catch::Matchers::ContainsSubstring("unresolved catalogue reference") &&
+                        Catch::Matchers::ContainsSubstring("C3M0032120K"));
+}

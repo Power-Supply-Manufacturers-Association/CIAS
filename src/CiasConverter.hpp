@@ -46,6 +46,15 @@ struct CiasCircuit {
     std::vector<Port> ports;
     std::vector<Component> components;
     std::vector<Connection> connections;
+    // Optional brick-level data-provenance trail (CIAS.json `provenance`, ABT #479).
+    // Carried OPAQUELY: nothing in this library interprets it, and to_subckt does not
+    // need it — but it must survive a from_json/to_json round-trip. It did not before
+    // ABT #540: the struct had no member for it, so loading and re-saving a brick
+    // SILENTLY dropped the field, and 7,554 connector pin-field bricks carry it as the
+    // entire assumption record for a derived artifact. A json rather than a typed
+    // mirror, deliberately: an opaque passthrough cannot drift from the PEAS definition
+    // CIAS $refs, whereas a typed copy would have to be kept in sync by hand.
+    json provenance = nullptr;
 
     static CiasCircuit from_json(const json& j);
     json to_json() const;

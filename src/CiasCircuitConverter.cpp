@@ -168,9 +168,20 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
     std::ostringstream body;
     for (const auto& c : circuit.components) {
         const json& d = c.data;
-        if (!d.is_object())
+        if (!d.is_object()) {
+            // A URI-form `data` is legal CIAS, not corruption — it just has to be
+            // RESOLVED before a netlist can be emitted. Say that, instead of the old
+            // "has no PEAS data object", which reads like the brick is broken and sent
+            // more than one reader looking for a defect that was not there (ABT #540).
+            if (d.is_string())
+                throw std::runtime_error(
+                    "CiasCircuitConverter: component '" + c.name + "' is an unresolved "
+                    "catalogue reference (" + d.get<std::string>() + "). Resolve it to an "
+                    "inline PEAS document before emitting — this converter does not read "
+                    "part-data files.");
             throw std::runtime_error(
                 "CiasCircuitConverter: component '" + c.name + "' has no PEAS data object");
+        }
 
         if (d.contains("resistor")) {
             check_pins(c.name, "resistor", {"1", "2"});
@@ -1335,9 +1346,19 @@ std::vector<std::string> validate_cias_structure(const CiasCircuit& circuit) {
             problems.push_back("duplicate port name '" + p.name + "'");
     }
 
+    // MUST mirror peas.json's top-level oneOf discriminators, ALL of them — this list
+    // decides whether a component is structurally well-formed, not whether the emitter
+    // can lower it. Those are different questions: varistor/controller/connector/
+    // transmissionLine are legal PEAS and legal here, and throw later at emission
+    // (ABT #510). 'thermistor' was missing until ABT #540, so a perfectly valid inline
+    // PEAS thermistor was reported as "0 discriminators (expected exactly 1)" — and the
+    // list became load-bearing for DATA validation the moment TAS's changed_records_gate
+    // started calling validate_cias_structure on every brick. tests/test_cias_convert.cpp
+    // cross-checks this against peas.json so it cannot drift again.
     static const std::vector<std::string> KNOWN = {
         "resistor", "capacitor", "magnetic", "semiconductor", "varistor",
-        "controller", "connector", "analog", "timeBase", "behavioral", "transmissionLine"};
+        "controller", "connector", "analog", "timeBase", "thermistor",
+        "behavioral", "transmissionLine"};
     for (const auto& c : circuit.components) {
         if (c.name.empty()) problems.push_back("a component has an empty name");
         else if (!compNames.insert(c.name).second)

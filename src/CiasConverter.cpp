@@ -42,6 +42,8 @@ CiasCircuit CiasCircuit::from_json(const json& j) {
         circuit.connections.push_back(c);
     }
 
+    if (j.contains("provenance")) circuit.provenance = j.at("provenance");
+
     return circuit;
 }
 
@@ -84,6 +86,10 @@ json CiasCircuit::to_json() const {
         }
         j["connections"].push_back(c);
     }
+
+    // Emit only when present: CIAS.json has no default for `provenance`, and writing an
+    // explicit null would turn "this brick has no trail" into "its trail is null".
+    if (!provenance.is_null()) j["provenance"] = provenance;
 
     return j;
 }

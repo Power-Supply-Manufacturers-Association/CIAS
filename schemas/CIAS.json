@@ -14,15 +14,18 @@
     },
     "ports": {
       "type": "array",
-      "description": "External terminals of the brick — its connection studs. A TAS stage types and wires these. A net is exposed at a terminal by including a portEndpoint that names it.",
+      "minItems": 1,
+      "description": "External terminals of the brick — its connection studs. A TAS stage types and wires these. A net is exposed at a terminal by including a portEndpoint that names it. At least one: a brick with no terminals cannot be wired to anything, which contradicts what a brick IS (a .subckt, not runnable by itself). ARRAY ORDER IS SIGNIFICANT to one consumer — CiasCircuitConverter emits the .subckt header nodes in this order, so a netlist instantiated positionally rather than by name depends on it; keep the order stable across regenerations of a brick.",
       "items": { "$ref": "#/$defs/port" }
     },
     "components": {
       "type": "array",
+      "description": "The parts placed in this brick. Order carries no meaning; components are referenced by name from connection endpoints.",
       "items": { "$ref": "#/$defs/component" }
     },
     "connections": {
       "type": "array",
+      "description": "The brick's internal nets. Order carries no meaning. Every net is purely electrical — see the connection definition for why there is no coupling edge.",
       "items": { "$ref": "#/$defs/connection" }
     },
     "provenance": {
@@ -66,10 +69,14 @@
           "description": "Reference designator unique within THIS brick (e.g. 'Qh', 'Lr', 'C_in'). Connection endpoints refer to it by this name."
         },
         "data": {
-          "description": "The component itself: an inline PEAS document, or a URI string into a part-data file (e.g. 'TAS/data/mosfets.ndjson?partNumber=C3M0032120K').",
+          "description": "The component itself: an inline PEAS document, or a URI string into a part-data file. The URI grammar is '<catalogue>.ndjson?<key>=<value>' with EXACTLY ONE key=value pair, no URL-encoding, and exactly three legal keys: 'partNumber' (e.g. 'TAS/data/mosfets.ndjson?partNumber=C3M0032120K'), 'name' (for a brick-valued reference, e.g. 'TAS/data/circuits.ndjson?name=half-bridge'), and 'placeholder' (a DELIBERATELY unresolvable pre-sourcing slot — a part not chosen yet). A resolvable URI must match exactly one record in the named file. Note what the schema cannot check: that the file exists, that the record exists, or that it is unique. Those are the job of the referential-integrity pass (TAS/scripts/check_component_uris.py), so a dangling reference is invisible here by construction. The two branches are disjoint without a const discriminator because the PEAS branch pins a top-level object type, so a string can never satisfy it — see the guard test in CIAS/tests.",
           "oneOf": [
             { "$ref": "https://psma.com/peas/peas.json" },
-            { "type": "string", "minLength": 1 }
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\\s?]+\\.ndjson\\?[A-Za-z][A-Za-z0-9]*=[^&=?]+$"
+            }
           ]
         }
       }
@@ -97,7 +104,7 @@
 
     "endpoint": {
       "title": "endpoint",
-      "$comment": "An endpoint of a net: either a specific pin of a component, or one of the brick's external terminals (which exposes the net there).",
+      "description": "An endpoint of a net: either a specific pin of a component, or one of the brick's external terminals (which exposes the net there). The two branches carry no const discriminator and do not need one — both are closed objects with disjoint required sets ({component, pin} vs {port}), so an object carrying all three satisfies neither and the oneOf cannot misclassify.",
       "oneOf": [
         { "$ref": "#/$defs/pinEndpoint" },
         { "$ref": "#/$defs/portEndpoint" }
