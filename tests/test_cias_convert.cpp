@@ -862,3 +862,40 @@ TEST_CASE("an unresolved catalogue URI says so, and names itself", "[cias][uri]"
                         Catch::Matchers::ContainsSubstring("unresolved catalogue reference") &&
                         Catch::Matchers::ContainsSubstring("C3M0032120K"));
 }
+
+TEST_CASE("magnetic: a winding count that would make K-card names ambiguous is refused",
+          "[cias]") {
+    // "K<name>_<ij>" concatenates the two winding indices with no separator, so it stops
+    // being decodable once an index reaches two digits. The danger is not unreadability:
+    // two DISTINCT pairs can land on one SPICE element name, and a duplicate K card does
+    // not error — the later silently replaces the earlier, leaving windings uncoupled or
+    // coupled to the wrong partner. Ten windings (indices 0..9) is the last safe width.
+    auto xfmr = [](size_t secondaries) {
+        json ports = json::array(), conns = json::array();
+        auto add = [&](const std::string& pin, const std::string& port) {
+            ports.push_back({{"name", port}});
+            conns.push_back(pin_port_net("n" + port, "T1", pin, port));
+        };
+        add("primary_start", "ps");
+        add("primary_end", "pe");
+        json ratios = json::array(), leak = json::array();
+        for (size_t s = 1; s <= secondaries; ++s) {
+            add("secondary" + std::to_string(s) + "_start", "s" + std::to_string(s) + "s");
+            add("secondary" + std::to_string(s) + "_end", "s" + std::to_string(s) + "e");
+            ratios.push_back(2.0);
+            leak.push_back(0.00036);
+        }
+        json mag = {{"magnetic", json::object()},
+                    {"inputs", {{"designRequirements",
+                                 {{"magnetizingInductance", {{"nominal", 1e-3}}},
+                                  {"turnsRatios", ratios},
+                                  {"leakageInductance", leak}}}}}};
+        return json{{"name", "x"}, {"ports", ports},
+                    {"components", json::array({{{"name", "T1"}, {"data", mag}}})},
+                    {"connections", conns}};
+    };
+    // 10 windings: every index is one digit, so the names stay decodable.
+    CHECK_NOTHROW(emit(xfmr(9)));
+    // 11 windings: index 10 appears and the format can no longer be trusted.
+    CHECK_THROWS_WITH(emit(xfmr(10)), ContainsSubstring("ambiguous beyond ten"));
+}

@@ -417,6 +417,22 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                         kToPri[i + 1] = std::sqrt(1.0 - lk / lp);
                     }
                 }
+                // The "<name>_<ij>" naming below concatenates the two winding indices without
+                // a separator, so it is only unambiguous while both are single digits. At ten
+                // windings KT1_112 could mean (1,12) or (11,2) — and two distinct pairs can
+                // then collide on ONE SPICE element name, which does not error: the later card
+                // silently replaces the earlier one and two windings end up uncoupled or
+                // wrongly coupled. Refuse instead. The name format is a fixed contract with
+                // Kirchhoff's decks and equivalence tests, so the bound is what gives rather
+                // than the spelling. (ABT #766, where unifying the two conventions in this
+                // file is proposed as the real fix.)
+                if (indNames.size() > 10)
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: magnetic '" + c.name + "' has " +
+                        std::to_string(indNames.size()) +
+                        " windings; the K-card name format '<name>_<ij>' concatenates winding "
+                        "indices and is ambiguous beyond ten, where two winding pairs would "
+                        "collide on one element name and silently mis-couple (ABT #766)");
                 for (size_t i = 0; i < indNames.size(); ++i)
                     for (size_t j = i + 1; j < indNames.size(); ++j) {
                         // sec-sec coupling goes through the shared primary path: k_ij = k_i*k_j.
