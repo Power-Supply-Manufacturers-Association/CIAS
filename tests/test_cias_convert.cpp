@@ -104,15 +104,38 @@ TEST_CASE("diode emits its spiceModel verbatim — no datasheet fabrication", "[
     CHECK_THAT(net, ContainsSubstring(".model MODEL_D5 D(Is=1e-09 N=1.8 )"));
 }
 
-TEST_CASE("semiconductor without spiceModel throws", "[cias]") {
-    json diode = {{"semiconductor", {{"diode", json::object()}}},
-                  {"inputs", {{"designRequirements", json::object()}}}};
-    json c = {{"name", "d1"},
-              {"ports", json::array({{{"name", "a"}}, {{"name", "k"}}})},
-              {"components", json::array({{{"name", "D1"}, {"data", diode}}})},
-              {"connections", json::array({pin_port_net("na", "D1", "anode", "a"),
-                                           pin_port_net("nk", "D1", "cathode", "k")})}};
-    CHECK_THROWS_WITH(emit(c), ContainsSubstring("no spiceModel"));
+// A spiceModel is OPTIONAL for the two devices that have an ideal realization, and required
+// for the two that do not. The test below used to assert that ANY semiconductor without one
+// throws, which was the contract before model-less emission was introduced: rendering circuits
+// that need not carry vendor models is the point of CIAS, so a diode now emits the ideal D
+// template built from its electrical block. Both halves of the current rule are pinned here —
+// the permissive one and the strict one — because a test that only checked the throw would go
+// on passing if model-less emission silently stopped working.
+TEST_CASE("a diode needs no spiceModel; a bjt does", "[cias]") {
+    auto circ = [](const char* devKey, const char* name, json pins) {
+        json dev = {{"semiconductor", {{devKey, json::object()}}},
+                    {"inputs", {{"designRequirements", json::object()}}}};
+        json ports = json::array(), conns = json::array();
+        for (auto& p : pins) {
+            ports.push_back({{"name", p[1].get<std::string>()}});
+            conns.push_back(pin_port_net("n" + p[1].get<std::string>(), name,
+                                         p[0].get<std::string>(), p[1].get<std::string>()));
+        }
+        return json{{"name", "c"}, {"ports", ports},
+                    {"components", json::array({{{"name", name}, {"data", dev}}})},
+                    {"connections", conns}};
+    };
+    // diode: no spiceModel is fine — an ideal D card and its .model are emitted.
+    const std::string net = emit(circ("diode", "D1",
+                                      json::array({{"anode", "a"}, {"cathode", "k"}})));
+    CHECK_THAT(net, ContainsSubstring("DD1 a k "));
+    CHECK_THAT(net, ContainsSubstring(".model"));
+
+    // bjt: no ideal realization exists, so it must still refuse rather than invent one.
+    CHECK_THROWS_WITH(emit(circ("bjt", "Q1",
+                                json::array({{"collector", "c"}, {"base", "b"},
+                                             {"emitter", "e"}}))),
+                      ContainsSubstring("must carry a spiceModel"));
 }
 
 TEST_CASE("VDMOS mosfet emits a 3-node M card; other models 4-node", "[cias]") {
@@ -257,9 +280,14 @@ TEST_CASE("magnetic: sec-sec coupling is k_i*k_j and corrupt leakage throws", "[
                // Lleak = Lp*(1-k^2) with k=0.8 -> Lleak = 0.36e-3
                {"leakageInductance", json::array({0.00036, 0.00036})}};
     const std::string net = emit(circ(dr));
-    CHECK_THAT(net, ContainsSubstring("KT1_0_1 LT1_pri LT1_sec1 0.8"));
+    // The magnetic path names mutual couplings "<name>_<ij>" with the winding indices
+    // CONCATENATED — KT1_01, not KT1_0_1. That spelling is deliberate and load-bearing:
+    // Kirchhoff's decks and its MKF-equivalence tests are written against it. (The
+    // coupledInductors path uses "<name>_<i>_<j>" instead; the two conventions disagree,
+    // which is filed separately — it is not this test's business to reconcile them.)
+    CHECK_THAT(net, ContainsSubstring("KT1_01 LT1_pri LT1_sec1 0.8"));
     // sec-sec: 0.8*0.8 = 0.64 (was min(k_i,k_j)=0.8 before the fix)
-    CHECK_THAT(net, ContainsSubstring("KT1_1_2 LT1_sec1 LT1_sec2 0.64"));
+    CHECK_THAT(net, ContainsSubstring("KT1_12 LT1_sec1 LT1_sec2 0.64"));
 
     json bad = dr; bad["leakageInductance"] = json::array({0.002});  // > Lp
     CHECK_THROWS_WITH(emit(circ(bad)), ContainsSubstring("leakage inductance >= magnetizing"));
