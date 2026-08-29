@@ -340,11 +340,30 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 }
                 check_pins(c.name, "magnetic", allowed);
             }
-            // MKF_MODEL path: the magnetic carries a pre-fitted MKF-exported SPICE subcircuit
+            // MKF_MODEL path: the part carries a pre-fitted MKF-exported SPICE subcircuit
             // (real winding Rdc + AC-resistance ladder + magnetizing L + leakage coupling).
             // The assembler hoists the .subckt definition; here we emit only the X instance.
-            if (mag.contains("modelOutputs") && mag.at("modelOutputs").contains("spiceSubcircuit")) {
-                const json& sk = mag.at("modelOutputs").at("spiceSubcircuit");
+            //
+            // WHERE THE FIELD LIVES (ABT #947). This used to read
+            // magnetic.modelOutputs.spiceSubcircuit -- a key the MAS magnetic schema FORBIDS
+            // (additionalProperties: false), which made this whole path unreachable from
+            // schema-valid data: the only documents that could take it were invalid ones. The
+            // legal home is the PEAS component's own `outputs` -- "Computed results (losses,
+            // thermal, impedance, etc.)", explicitly open -- and a pre-fitted subcircuit is
+            // exactly a computed result. Verified: a PEAS magnetic part carrying
+            // outputs.spiceSubcircuit validates with zero errors against the full PEAS+MAS
+            // registry. Only the OBJECT form of outputs is consulted: the array form is
+            // per-operating-point results, and a subcircuit is not per-operating-point.
+            // No migration concern: zero shipped circuits carry the old key (it never could
+            // validate), and this converter was its only reader.
+            if (mag.contains("modelOutputs"))
+                throw std::runtime_error(
+                    "CiasCircuitConverter: magnetic '" + c.name + "' carries modelOutputs, a key "
+                    "the MAS magnetic schema forbids; the spiceSubcircuit reference moved to the "
+                    "PEAS component's outputs (ABT #947)");
+            if (d.contains("outputs") && d.at("outputs").is_object()
+                    && d.at("outputs").contains("spiceSubcircuit")) {
+                const json& sk = d.at("outputs").at("spiceSubcircuit");
                 body << "X" << c.name << " " << node_of(c.name, "primary_start")
                      << " " << node_of(c.name, "primary_end");
                 for (size_t i = 0; i < nsec; ++i) {

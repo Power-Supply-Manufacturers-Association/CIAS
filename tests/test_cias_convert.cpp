@@ -899,3 +899,29 @@ TEST_CASE("magnetic: a winding count that would make K-card names ambiguous is r
     // 11 windings: index 10 appears and the format can no longer be trusted.
     CHECK_THROWS_WITH(emit(xfmr(10)), ContainsSubstring("ambiguous beyond ten"));
 }
+
+TEST_CASE("magnetic MKF_MODEL path reads outputs.spiceSubcircuit (ABT #947)", "[cias]") {
+    // The pre-fitted subcircuit reference lives in the PEAS component's open `outputs` bag --
+    // the only home the schemas allow. magnetic.modelOutputs is FORBIDDEN by the closed MAS
+    // schema, and anything still writing it must hear so loudly rather than silently fall to
+    // the ideal path.
+    json mag = {{"magnetic", {{"name", "m"}}},
+                {"inputs", {{"designRequirements",
+                             {{"magnetizingInductance", {{"nominal", 1e-6}}},
+                              {"turnsRatios", json::array()}}}}},
+                {"outputs", {{"spiceSubcircuit", {{"reference", "WE_123"}}}}}};
+    json c = {{"name", "b"},
+              {"ports", json::array({{{"name", "p"}}, {{"name", "n"}}})},
+              {"components", json::array({{{"name", "L1"}, {"data", mag}}})},
+              {"connections",
+               json::array({pin_port_net("np", "L1", "primary_start", "p"),
+                            pin_port_net("nn", "L1", "primary_end", "n")})}};
+    const std::string net = emit(c);
+    CHECK_THAT(net, ContainsSubstring("XL1 p n WE_123"));
+
+    json bad = c;
+    bad["components"][0]["data"].erase("outputs");
+    bad["components"][0]["data"]["magnetic"]["modelOutputs"] =
+        {{"spiceSubcircuit", {{"reference", "WE_123"}}}};
+    CHECK_THROWS_WITH(emit(bad), ContainsSubstring("ABT #947"));
+}
