@@ -1081,3 +1081,92 @@ TEST_CASE("resistor: a part that also carries inputs still prefers the part", "[
     CHECK_THAT(net, ContainsSubstring("RR1 a b 4700"));
     CHECK_THAT(net, !ContainsSubstring("RR1 a b 1000"));
 }
+
+// ---------------------------------------------------------------------------
+// A magnetic states its own inductance, winding resistance and self-resonance.
+// Before this, a catalogue magnetic could not be lowered AT ALL: nsec was read
+// from d.at("inputs") before either emission path, so a part with no `inputs`
+// died there — including one carrying a complete MKF subcircuit, which needs no
+// requirement whatsoever.
+// ---------------------------------------------------------------------------
+namespace {
+json mag_brick_data(json data) {
+    return json{
+        {"name", "mb"},
+        {"ports", json::array({json{{"name", "a"}}, json{{"name", "b"}}})},
+        {"components", json::array({json{{"name", "L1"}, {"data", std::move(data)}}})},
+        {"connections", json::array({pin_port_net("na", "L1", "primary_start", "a"),
+                                     pin_port_net("nb", "L1", "primary_end", "b")})},
+    };
+}
+json mag_part(json electrical) {
+    return json{{"magnetic",
+                 json{{"manufacturerInfo",
+                       json{{"name", "Wurth Elektronik"}, {"reference", "74438356010"},
+                            {"datasheetInfo",
+                             json{{"electrical", json::array({std::move(electrical)})}}}}}}}};
+}
+}  // namespace
+
+TEST_CASE("magnetic: a catalogue part lowers with no inputs at all", "[cias]") {
+    const std::string net = emit(mag_brick_data(mag_part(json{
+        {"subtype", "inductor"}, {"inductance", 1e-6}})));
+    CHECK_THAT(net, ContainsSubstring("LL1 a b 1e-06"));
+}
+
+TEST_CASE("magnetic: winding resistance and self-resonance are emitted when stated",
+          "[cias]") {
+    const std::string net = emit(mag_brick_data(mag_part(json{
+        {"subtype", "inductor"},
+        {"inductance", 1e-6},
+        {"dcResistance", 0.012},
+        {"selfResonantFrequency", 60e6}})));
+    CHECK_THAT(net, ContainsSubstring("RL1_rdc a "));
+    CHECK_THAT(net, ContainsSubstring("0.012"));
+    // Cp = 1/((2*pi*60e6)^2 * 1e-6) = 7.036e-12
+    CHECK_THAT(net, ContainsSubstring("CL1_cp a b 7.036"));
+}
+
+TEST_CASE("magnetic: no stated Rdc or SRF emits neither", "[cias]") {
+    const std::string net = emit(mag_brick_data(mag_part(json{
+        {"subtype", "inductor"}, {"inductance", 1e-6}})));
+    CHECK_THAT(net, !ContainsSubstring("RL1_rdc"));
+    CHECK_THAT(net, !ContainsSubstring("CL1_cp"));
+}
+
+TEST_CASE("magnetic: a measured L(I) curve becomes an odd flux table", "[cias]") {
+    const std::string net = emit(mag_brick_data(mag_part(json{
+        {"subtype", "inductor"},
+        {"inductance", 1e-6},
+        {"inductancePoints", json::array({
+            json{{"inductance", 1e-6}, {"current", 0}},
+            json{{"inductance", 9.964e-7}, {"current", 1.75}},
+            json{{"inductance", 6e-7}, {"current", 14.3}}})}})));
+    CHECK_THAT(net, ContainsSubstring("Vsense_L1 "));
+    CHECK_THAT(net, ContainsSubstring("V=ddt(pwl(I(Vsense_L1)"));
+    // odd: the negative half mirrors the positive one
+    CHECK_THAT(net, ContainsSubstring("-14.3"));
+    CHECK_THAT(net, ContainsSubstring("14.3"));
+    // and saturation puts the flux BELOW the linear L*I of 1.43e-05
+    CHECK_THAT(net, !ContainsSubstring("1.43e-05"));
+}
+
+TEST_CASE("magnetic: LTspice takes the native Flux= attribute", "[cias]") {
+    const std::string net = emit(mag_brick_data(mag_part(json{
+        {"subtype", "inductor"},
+        {"inductance", 1e-6},
+        {"inductancePoints", json::array({
+            json{{"inductance", 1e-6}, {"current", 0}},
+            json{{"inductance", 6e-7}, {"current", 14.3}}})}})),
+        CIAS::CircuitSimulator::Ltspice);
+    CHECK_THAT(net, ContainsSubstring("Flux=table(x,"));
+    CHECK_THAT(net, !ContainsSubstring("ddt("));
+}
+
+TEST_CASE("magnetic: a part stating nothing at all throws, naming where it looked",
+          "[cias]") {
+    CHECK_THROWS_WITH(
+        emit(mag_brick_data(json{{"magnetic",
+                                  json{{"manufacturerInfo", json{{"name", "ACME"}}}}}})),
+        ContainsSubstring("states no inductance"));
+}

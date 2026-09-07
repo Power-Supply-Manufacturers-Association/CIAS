@@ -55,6 +55,70 @@ double resolved_at(const json& data, std::initializer_list<const char*> keys, co
     }
 }
 
+// ---- a magnetic part's own datasheet block ---------------------------------
+// MAS keeps a magnetic's measured electrical data in an ARRAY, one entry per
+// winding-ish subtype ({subtype:"inductor", inductance, dcResistance,
+// selfResonantFrequency, inductancePoints, ...}). These read the first entry,
+// which is the two-terminal inductor case and the only one this tier claims.
+const json* ds_electrical(const json& mag) {
+    if (!mag.is_object() || !mag.contains("manufacturerInfo")) return nullptr;
+    const json& mi = mag.at("manufacturerInfo");
+    if (!mi.is_object() || !mi.contains("datasheetInfo")) return nullptr;
+    const json& di = mi.at("datasheetInfo");
+    if (!di.is_object() || !di.contains("electrical")) return nullptr;
+    const json& el = di.at("electrical");
+    if (el.is_array()) return el.empty() ? nullptr : &el.at(0);
+    return el.is_object() ? &el : nullptr;
+}
+
+std::optional<double> ds_num(const json* obj, const char* key) {
+    if (!obj || !obj->is_object() || !obj->contains(key)) return std::nullopt;
+    try {
+        double v = PEAS::resolve_dimensional_values(obj->at(key));
+        if (std::isfinite(v) && v > 0) return v;
+    } catch (const std::exception&) {}
+    return std::nullopt;
+}
+
+std::optional<double> ds_inductance(const json& mag) {
+    return ds_num(ds_electrical(mag), "inductance");
+}
+
+// Psi(i) from the part's measured L(I) curve, by trapezoidal integration, and
+// mirrored odd about the origin. An EVEN flux would make the inductor generate
+// energy on the negative half-cycle.
+//
+// Returns empty when the record states fewer than two usable points — the
+// caller then emits the plain linear inductor, which is what "no curve" means.
+std::vector<std::pair<double, double>> flux_table(const json* el, double L) {
+    std::vector<std::pair<double, double>> out;
+    if (!el || !el->is_object() || !el->contains("inductancePoints")) return out;
+    const json& pts = el->at("inductancePoints");
+    if (!pts.is_array()) return out;
+    std::vector<std::pair<double, double>> li;   // (current, inductance)
+    for (const auto& p : pts) {
+        if (!p.is_object() || !p.contains("current") || !p.contains("inductance")) continue;
+        try {
+            const double i = PEAS::resolve_dimensional_values(p.at("current"));
+            const double l = PEAS::resolve_dimensional_values(p.at("inductance"));
+            if (std::isfinite(i) && std::isfinite(l) && i >= 0 && l > 0) li.emplace_back(i, l);
+        } catch (const std::exception&) {}
+    }
+    if (li.size() < 2) return out;
+    std::sort(li.begin(), li.end());
+    if (li.front().first != 0.0) li.insert(li.begin(), {0.0, L});
+    std::vector<std::pair<double, double>> pos{{0.0, 0.0}};
+    for (size_t k = 1; k < li.size(); ++k) {
+        const double di = li[k].first - li[k - 1].first;
+        const double psi = pos.back().second + 0.5 * (li[k].second + li[k - 1].second) * di;
+        pos.emplace_back(li[k].first, psi);
+    }
+    for (auto it = pos.rbegin(); it != pos.rend(); ++it)
+        if (it->first > 0.0) out.emplace_back(-it->first, -it->second);
+    out.insert(out.end(), pos.begin(), pos.end());
+    return out;
+}
+
 // Resolve a leaf json value that may be a bare number or a dimensionWithTolerance.
 double resolved_leaf(const json& v, const std::string& what) {
     try {
@@ -451,9 +515,19 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
         }
         else if (d.contains("magnetic")) {
             const json& mag = d.at("magnetic");
+            // The requirement is OPTIONAL here, and reading it unconditionally is what
+            // made every catalogue magnetic unlowerable: a TAS magnetic is
+            // {magnetic:{manufacturerInfo}} with no `inputs` at all, so d.at("inputs")
+            // threw json::out_of_range before either emission path was reached — even
+            // for a part carrying a complete MKF subcircuit, which needs no requirement
+            // whatsoever. And it threw naming neither the component nor the field.
+            const json* dr = nullptr;
+            if (d.contains("inputs") && d.at("inputs").is_object() &&
+                d.at("inputs").contains("designRequirements") &&
+                d.at("inputs").at("designRequirements").is_object())
+                dr = &d.at("inputs").at("designRequirements");
             size_t nsec = 0;
-            if (d.at("inputs").at("designRequirements").contains("turnsRatios"))
-                nsec = d.at("inputs").at("designRequirements").at("turnsRatios").size();
+            if (dr && dr->contains("turnsRatios")) nsec = dr->at("turnsRatios").size();
             {
                 std::set<std::string> allowed = {"primary_start", "primary_end"};
                 for (size_t i = 1; i <= nsec; ++i) {
@@ -495,8 +569,76 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 }
                 body << " " << sk.at("reference").get<std::string>() << "\n";
             }
+            // DATASHEET path: a real two-terminal inductor, from what the part states.
+            // Between the fitted MKF subcircuit above and the ideal L below, and it is the
+            // tier a catalogue part actually lands in — 74438356010 states 1 uH, 12 mOhm of
+            // winding resistance and a 60 MHz self-resonance, and every one of those was
+            // being thrown away for an ideal inductor that never resonates and never loses
+            // anything.
+            //
+            // Only for a two-terminal part (nsec == 0). A transformer's coupling is not
+            // derivable from one winding's datasheet block, so a multi-winding part falls
+            // through to the requirement path rather than being guessed at.
+            //
+            // MKF remains where magnetics are COMPUTED. Nothing here computes a magnetic
+            // quantity: it renders measured datasheet values into cards, and derives only
+            // the self-capacitance implied by the part's own stated resonance,
+            // Cp = 1/((2*pi*f)^2*L), which is the two-terminal resonance identity and not
+            // magnetics.
+            else if (nsec == 0 && ds_inductance(mag)) {
+                const json* el = ds_electrical(mag);
+                const double L = *ds_inductance(mag);
+                const std::string np = node_of(c.name, "primary_start");
+                const std::string nn = node_of(c.name, "primary_end");
+                std::optional<double> rdc = ds_num(el, "dcResistance");
+                std::optional<double> srf = ds_num(el, "selfResonantFrequency");
+                std::vector<std::pair<double, double>> psi = flux_table(el, L);
+
+                // node chain: np --Rdc--> a --L--> nn, with Cp across the whole part
+                std::string a = np;
+                if (rdc) {
+                    const std::string mid = np + "__" + c.name + "_rdc";
+                    body << "R" << c.name << "_rdc " << a << " " << mid << " " << num(*rdc) << "\n";
+                    a = mid;
+                }
+                if (psi.size() >= 2) {
+                    // A measured L(I) curve, rendered as a flux table: Psi(i) is the
+                    // trapezoidal integral of the part's own inductancePoints, mirrored odd
+                    // so the inductor behaves identically in both directions (an even Psi
+                    // would GENERATE energy on the negative half — see the behavioral note).
+                    std::ostringstream tbl;
+                    for (size_t i = 0; i < psi.size(); ++i)
+                        tbl << (i ? ", " : "") << num(psi[i].first) << ", " << num(psi[i].second);
+                    if (dialect == SpiceDialect::Ltspice) {
+                        body << "L" << c.name << " " << a << " " << nn
+                             << " Flux=table(x, " << tbl.str() << ")\n";
+                    } else {
+                        const std::string sense = "Vsense_" + c.name;
+                        const std::string n_int = a + "__" + c.name + "_L";
+                        body << sense << " " << a << " " << n_int << " DC 0\n";
+                        body << "B" << c.name << " " << n_int << " " << nn
+                             << " V=ddt(pwl(I(" << sense << "), " << tbl.str() << "))\n";
+                    }
+                } else {
+                    body << "L" << c.name << " " << a << " " << nn << " " << num(L) << "\n";
+                }
+                // The self-resonance the part states. Absent SRF -> no capacitor, rather
+                // than an inductor asserted to resonate nowhere.
+                if (srf && *srf > 0) {
+                    const double cp = 1.0 / (4.0 * 3.14159265358979323846 *
+                                             3.14159265358979323846 * (*srf) * (*srf) * L);
+                    body << "C" << c.name << "_cp " << np << " " << nn << " " << num(cp) << "\n";
+                }
+            }
             else {
                 // Ideal path: one L per winding + pairwise K coupling.
+                if (!dr || !dr->contains("magnetizingInductance"))
+                    throw std::runtime_error(
+                        "CiasCircuitConverter: magnetic '" + c.name + "' states no inductance — "
+                        "it carries no outputs.spiceSubcircuit (a fitted MKF model), no "
+                        "manufacturerInfo.datasheetInfo.electrical inductance, and no "
+                        "inputs.designRequirements.magnetizingInductance. There is nothing "
+                        "here to simulate.");
                 const double lp = resolved_at(d, {"inputs", "designRequirements", "magnetizingInductance"},
                                               "magnetic " + c.name);
                 if (lp <= 0.0)
