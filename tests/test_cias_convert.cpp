@@ -1020,3 +1020,64 @@ TEST_CASE("capacitor: a part that also carries inputs still prefers the part", "
     CHECK_THAT(net, !ContainsSubstring("1e-06"));
     CHECK_THAT(net, ContainsSubstring("RC1_esr"));
 }
+
+// ---------------------------------------------------------------------------
+// The resistor follows the capacitor's order, for the same reason (ABT #1136).
+// ---------------------------------------------------------------------------
+namespace {
+json res_brick_data(json data) {
+    return json{
+        {"name", "rb"},
+        {"ports", json::array({json{{"name", "a"}}, json{{"name", "b"}}})},
+        {"components", json::array({json{{"name", "R1"}, {"data", std::move(data)}}})},
+        {"connections", json::array({pin_port_net("na", "R1", "1", "a"),
+                                     pin_port_net("nb", "R1", "2", "b")})},
+    };
+}
+json res_part(json datasheet_info) {
+    return json{{"resistor",
+                 json{{"manufacturerInfo",
+                       json{{"name", "Yageo"}, {"reference", "RC0402FR-0710KL"},
+                            {"datasheetInfo", std::move(datasheet_info)}}}}}};
+}
+}  // namespace
+
+TEST_CASE("resistor: modelParams win, and carry their temperature coefficients",
+          "[cias]") {
+    const std::string net = emit(res_brick_data(res_part(json{
+        {"electrical", json{{"resistance", 4700.0}}},
+        {"modelParams", json{{"r", 10000.0}, {"tcr1", 1e-4}, {"tcr2", 2e-7}}}})));
+    CHECK_THAT(net, ContainsSubstring("RR1 a b 10000"));
+    CHECK_THAT(net, ContainsSubstring("TC1=0.0001"));
+    CHECK_THAT(net, ContainsSubstring("TC2=2e-07"));
+    CHECK_THAT(net, !ContainsSubstring("4700"));
+}
+
+TEST_CASE("resistor: no modelParams falls back to the datasheet resistance", "[cias]") {
+    const std::string net = emit(res_brick_data(res_part(json{
+        {"electrical", json{{"resistance", 4700.0}}}})));
+    CHECK_THAT(net, ContainsSubstring("RR1 a b 4700"));
+    // nothing states a coefficient, so none is invented
+    CHECK_THAT(net, !ContainsSubstring("TC1="));
+}
+
+TEST_CASE("resistor: no part data at all falls back to the requirement", "[cias]") {
+    CHECK_THAT(emit(res_brick_data(resistor_atom(1000.0))),
+               ContainsSubstring("RR1 a b 1000"));
+}
+
+TEST_CASE("resistor: neither a datasheet nor a requirement throws", "[cias]") {
+    CHECK_THROWS_WITH(
+        emit(res_brick_data(json{{"resistor",
+                                  json{{"manufacturerInfo",
+                                        json{{"name", "ACME"}, {"reference", "N"}}}}}})),
+        ContainsSubstring("states no resistance"));
+}
+
+TEST_CASE("resistor: a part that also carries inputs still prefers the part", "[cias]") {
+    json data = res_part(json{{"electrical", json{{"resistance", 4700.0}}}});
+    data["inputs"]["designRequirements"]["resistance"] = 1000.0;
+    const std::string net = emit(res_brick_data(data));
+    CHECK_THAT(net, ContainsSubstring("RR1 a b 4700"));
+    CHECK_THAT(net, !ContainsSubstring("RR1 a b 1000"));
+}

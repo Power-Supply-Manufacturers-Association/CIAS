@@ -185,16 +185,59 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
 
         if (d.contains("resistor")) {
             check_pins(c.name, "resistor", {"1", "2"});
-            // Ideal component: electrical value lives in inputs.designRequirements.
-            double r = resolved_at(d, {"inputs", "designRequirements", "resistance"},
-                                   "resistor " + c.name);
+            // THE PART FIRST, the requirement last — the same order as the capacitor
+            // below, and for the same reason: a catalogue resistor is the thing being
+            // simulated and has no `inputs` at all (ABT #1136).
+            //   1. modelParams   r, plus tcr1/tcr2 if the record states them
+            //   2. datasheetInfo electrical.resistance
+            //   3. inputs        the requirement
+            //   4. neither       throw
+            const json& resd = d.at("resistor");
+            const json* rdi = nullptr;
+            if (resd.contains("manufacturerInfo") && resd.at("manufacturerInfo").is_object() &&
+                resd.at("manufacturerInfo").contains("datasheetInfo") &&
+                resd.at("manufacturerInfo").at("datasheetInfo").is_object())
+                rdi = &resd.at("manufacturerInfo").at("datasheetInfo");
+            auto ropt = [&](const json* obj, const char* key) -> std::optional<double> {
+                if (!obj || !obj->is_object() || !obj->contains(key)) return std::nullopt;
+                try {
+                    double v = PEAS::resolve_dimensional_values(obj->at(key));
+                    if (std::isfinite(v)) return v;
+                } catch (const std::exception&) {}
+                return std::nullopt;
+            };
+            const json* rmp = (rdi && rdi->contains("modelParams") &&
+                               rdi->at("modelParams").is_object())
+                                  ? &rdi->at("modelParams") : nullptr;
+            const json* rel = (rdi && rdi->contains("electrical") &&
+                               rdi->at("electrical").is_object())
+                                  ? &rdi->at("electrical") : nullptr;
+            std::optional<double> rv = ropt(rmp, "r"), tc1, tc2;
+            if (rv) { tc1 = ropt(rmp, "tcr1"); tc2 = ropt(rmp, "tcr2"); }
+            if (!rv) rv = ropt(rel, "resistance");
+            if (!rv && d.contains("inputs"))
+                rv = resolved_at(d, {"inputs", "designRequirements", "resistance"},
+                                 "resistor " + c.name);
+            if (!rv)
+                throw std::runtime_error(
+                    "CiasCircuitConverter: resistor '" + c.name + "' states no resistance — "
+                    "it has neither a manufacturerInfo.datasheetInfo (modelParams.r or "
+                    "electrical.resistance) nor inputs.designRequirements.resistance. "
+                    "There is nothing here to simulate.");
+            double r = *rv;
             // A 0 Ohm resistor is a short (e.g. a dc-0 ammeter source we mapped to R).
             // LTspice rejects R=0 ("Resistance must not be zero") and ngspice's handling is
             // version-dependent; emit a negligible value instead (electrically a short, far
             // below any modelled impedance). Realization workaround, not a data default.
             if (r == 0.0) r = 1e-12;
             body << "R" << c.name << " " << node_of(c.name, "1") << " " << node_of(c.name, "2")
-                 << " " << num(r) << "\n";
+                 << " " << num(r);
+            // Temperature coefficients ride the card when the part states them, and are
+            // simply absent when it does not — never defaulted to zero, which would assert
+            // a flat resistor rather than an unmeasured one.
+            if (tc1) body << " TC1=" << num(*tc1);
+            if (tc2) body << " TC2=" << num(*tc2);
+            body << "\n";
         }
         else if (d.contains("capacitor")) {
             check_pins(c.name, "capacitor", {"1", "2"});
