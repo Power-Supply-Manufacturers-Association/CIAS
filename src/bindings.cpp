@@ -2,6 +2,8 @@
 #include <pybind11/stl.h>
 #include <pybind11_json/pybind11_json.hpp>
 #include "CiasConverter.hpp"
+#include <memory>
+
 #include "CiasCircuitConverter.hpp"
 
 namespace py = pybind11;
@@ -54,7 +56,19 @@ PYBIND11_MODULE(PyCIAS, m) {
         .value("Plecs",   CIAS::CircuitSimulator::Plecs)
         .export_values();
 
-    py::class_<CIAS::CiasCircuitConverter>(m, "CiasCircuitConverter")
+    // HOLDER MUST BE shared_ptr, because create() returns one. With the default
+    // unique_ptr holder pybind11 adopts the raw pointer out of the shared_ptr and
+    // takes sole ownership of an object the shared_ptr's control block still owns:
+    // both free it. That is the heap corruption in ABT #1137 — 'free(): invalid
+    // pointer', 'free(): invalid size', 'munmap_chunk(): invalid pointer' and a
+    // plain segfault, all from the same double delete, all landing wherever the
+    // allocator next looked rather than at the call.
+    //
+    // It fired on EVERY use of create(), successful conversions included, which is
+    // why PyCIAS could not be used from Python at all while the native library was
+    // healthy.
+    py::class_<CIAS::CiasCircuitConverter, std::shared_ptr<CIAS::CiasCircuitConverter>>(
+        m, "CiasCircuitConverter")
         .def(py::init<CIAS::CircuitSimulator>(), py::arg("target") = CIAS::CircuitSimulator::Ngspice,
              "Create a converter for the given simulator target.")
         .def_static("create", &CIAS::CiasCircuitConverter::create, py::arg("target"),
