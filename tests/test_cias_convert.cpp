@@ -925,3 +925,98 @@ TEST_CASE("magnetic MKF_MODEL path reads outputs.spiceSubcircuit (ABT #947)", "[
         {{"spiceSubcircuit", {{"reference", "WE_123"}}}};
     CHECK_THROWS_WITH(emit(bad), ContainsSubstring("ABT #947"));
 }
+
+// ---------------------------------------------------------------------------
+// The capacitor's source of truth, in order (ABT #1136).
+//
+// A catalogue capacitor is the thing being simulated; a designRequirements
+// capacitance is what somebody asked for before there was a part. Reading only
+// the requirement made a real part unlowerable — a TAS capacitor has no
+// `inputs` at all — and emitted an ideal C for one that could be lowered,
+// discarding an ESR and ESL the record states.
+// ---------------------------------------------------------------------------
+namespace {
+// `data` is a whole PEAS document: the discriminator key and `inputs` are
+// SIBLINGS ({capacitor:{…}, inputs:{…}}), which is the shape capacitor_atom
+// above builds and the shape a TAS catalogue record arrives in (minus inputs).
+json cap_brick_data(json data) {
+    return json{
+        {"name", "cb"},
+        {"ports", json::array({json{{"name", "a"}}, json{{"name", "b"}}})},
+        {"components", json::array({json{{"name", "C1"}, {"data", std::move(data)}}})},
+        {"connections", json::array({pin_port_net("na", "C1", "1", "a"),
+                                     pin_port_net("nb", "C1", "2", "b")})},
+    };
+}
+json cap_brick(json capacitor) {
+    return cap_brick_data(json{{"capacitor", std::move(capacitor)}});
+}
+json part_with(json datasheet_info) {
+    return json{{"manufacturerInfo",
+                 json{{"name", "Wurth Elektronik"},
+                      {"reference", "885342208014"},
+                      {"datasheetInfo", std::move(datasheet_info)}}}};
+}
+}  // namespace
+
+TEST_CASE("capacitor: modelParams win — Rs and Ls in series, Riso shunting", "[cias]") {
+    const std::string net = emit(cap_brick(part_with(json{
+        {"electrical", json{{"capacitance", 2.2e-8}, {"esr", 0.787}}},
+        {"modelParams", json{{"rs", 0.0616}, {"cs", 2.2e-8}, {"ls", 4.768e-10},
+                             {"riso", 4.54e9}}}})));
+    CHECK_THAT(net, ContainsSubstring("RC1_esr a "));
+    CHECK_THAT(net, ContainsSubstring("0.0616"));
+    CHECK_THAT(net, ContainsSubstring("LC1_esl "));
+    CHECK_THAT(net, ContainsSubstring("4.768e-10"));
+    CHECK_THAT(net, ContainsSubstring("CC1 "));
+    CHECK_THAT(net, ContainsSubstring("RC1_iso "));
+    // the equivalent circuit's own Cs, not the electrical block's rated value
+    CHECK_THAT(net, ContainsSubstring("2.2e-08"));
+    // and the electrical ESR is NOT also emitted — one resistor, from modelParams
+    CHECK_THAT(net, !ContainsSubstring("0.787"));
+}
+
+TEST_CASE("capacitor: no modelParams falls back to the datasheet, ESR included",
+          "[cias]") {
+    const std::string net = emit(cap_brick(part_with(json{
+        {"electrical", json{{"capacitance", 2.2e-8}, {"esr", 0.787}}}})));
+    CHECK_THAT(net, ContainsSubstring("RC1_esr a "));
+    CHECK_THAT(net, ContainsSubstring("0.787"));
+    CHECK_THAT(net, ContainsSubstring("CC1 "));
+    CHECK_THAT(net, ContainsSubstring("2.2e-08"));
+    // nothing states an ESL, so no inductor is invented
+    CHECK_THAT(net, !ContainsSubstring("LC1_esl"));
+    CHECK_THAT(net, !ContainsSubstring("RC1_iso"));
+}
+
+TEST_CASE("capacitor: a datasheet with no ESR emits the capacitor alone", "[cias]") {
+    const std::string net = emit(cap_brick(part_with(json{
+        {"electrical", json{{"capacitance", 2.2e-8}}}})));
+    CHECK_THAT(net, ContainsSubstring("CC1 a b 2.2e-08"));
+    CHECK_THAT(net, !ContainsSubstring("RC1_esr"));
+    CHECK_THAT(net, !ContainsSubstring("LC1_esl"));
+}
+
+TEST_CASE("capacitor: no part data at all falls back to the requirement", "[cias]") {
+    const std::string net = emit(cap_brick_data(capacitor_atom(1e-6)));
+    CHECK_THAT(net, ContainsSubstring("CC1 a b 1e-06"));
+    CHECK_THAT(net, !ContainsSubstring("RC1_esr"));
+}
+
+TEST_CASE("capacitor: neither a datasheet nor a requirement throws", "[cias]") {
+    CHECK_THROWS_WITH(
+        emit(cap_brick(json{{"manufacturerInfo",
+                             json{{"name", "ACME"}, {"reference", "NOTHING"}}}})),
+        ContainsSubstring("states no capacitance"));
+}
+
+TEST_CASE("capacitor: a part that also carries inputs still prefers the part", "[cias]") {
+    // the case the old order got backwards
+    json data{{"capacitor", part_with(json{{"electrical",
+                  json{{"capacitance", 2.2e-8}, {"esr", 0.787}}}})}};
+    data["inputs"]["designRequirements"]["capacitance"] = 1e-6;
+    const std::string net = emit(cap_brick_data(data));
+    CHECK_THAT(net, ContainsSubstring("2.2e-08"));
+    CHECK_THAT(net, !ContainsSubstring("1e-06"));
+    CHECK_THAT(net, ContainsSubstring("RC1_esr"));
+}

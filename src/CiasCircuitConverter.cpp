@@ -198,10 +198,89 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
         }
         else if (d.contains("capacitor")) {
             check_pins(c.name, "capacitor", {"1", "2"});
-            double cap = resolved_at(d, {"inputs", "designRequirements", "capacitance"},
-                                     "capacitor " + c.name);
-            body << "C" << c.name << " " << node_of(c.name, "1") << " " << node_of(c.name, "2")
-                 << " " << num(cap) << "\n";
+            const json& capd = d.at("capacitor");
+            const std::string n1 = node_of(c.name, "1"), n2 = node_of(c.name, "2");
+
+            // THE PART FIRST, the requirement only as the last resort. A catalogue
+            // capacitor is the thing being simulated; a designRequirements capacitance is
+            // what somebody asked for before there was a part. Preferring the requirement
+            // threw away everything the part knows, and reading ONLY the requirement made a
+            // real part unlowerable — a TAS capacitor has no `inputs` at all (ABT #1136).
+            //
+            // Order, in decreasing fidelity:
+            //   1. modelParams        the vendor's own equivalent circuit: Rs + Ls + Cs,
+            //                         with Riso shunting the capacitor element.
+            //   2. datasheetInfo      the rated capacitance, plus the ESR if the record
+            //                         states one. What is absent is simply not emitted —
+            //                         never defaulted, so an unstated ESR is a missing
+            //                         resistor and not a guessed one.
+            //   3. inputs             no part data at all: an ideal C from the requirement.
+            //   4. neither            throw. There is nothing here to simulate.
+            const json* di = nullptr;
+            if (capd.contains("manufacturerInfo") && capd.at("manufacturerInfo").is_object() &&
+                capd.at("manufacturerInfo").contains("datasheetInfo") &&
+                capd.at("manufacturerInfo").at("datasheetInfo").is_object())
+                di = &capd.at("manufacturerInfo").at("datasheetInfo");
+
+            auto opt_num = [&](const json* obj, const char* key) -> std::optional<double> {
+                if (!obj || !obj->is_object() || !obj->contains(key)) return std::nullopt;
+                try {
+                    double v = PEAS::resolve_dimensional_values(obj->at(key));
+                    if (std::isfinite(v) && v > 0) return v;
+                } catch (const std::exception&) {}
+                return std::nullopt;
+            };
+
+            const json* mp = (di && di->contains("modelParams") &&
+                              di->at("modelParams").is_object())
+                                 ? &di->at("modelParams") : nullptr;
+            const json* el = (di && di->contains("electrical") &&
+                              di->at("electrical").is_object())
+                                 ? &di->at("electrical") : nullptr;
+
+            std::optional<double> cs, rs, ls, riso;
+            if (mp) {
+                cs = opt_num(mp, "cs");
+                rs = opt_num(mp, "rs");
+                ls = opt_num(mp, "ls");
+                riso = opt_num(mp, "riso");
+            }
+            // modelParams without a capacitance is not an equivalent circuit; fall through
+            // to the rated value rather than emitting parasitics around nothing.
+            if (!cs) {
+                cs = opt_num(el, "capacitance");
+                if (cs && !rs) rs = opt_num(el, "esr");
+            }
+            // `inputs` is a SIBLING of the discriminator key in a PEAS document
+            // ({capacitor:{…}, inputs:{…}}), not a member of the capacitor.
+            if (!cs && d.contains("inputs"))
+                cs = resolved_at(d, {"inputs", "designRequirements", "capacitance"},
+                                 "capacitor " + c.name);
+            if (!cs)
+                throw std::runtime_error(
+                    "CiasCircuitConverter: capacitor '" + c.name + "' states no capacitance — "
+                    "it has neither a manufacturerInfo.datasheetInfo (modelParams.cs or "
+                    "electrical.capacitance) nor inputs.designRequirements.capacitance. "
+                    "There is nothing here to simulate.");
+
+            // Rs and Ls are IN SERIES with the element and Riso SHUNTS it, which is the
+            // topology the vendor fits its numbers to. Each is emitted only if stated, so
+            // a part with an ESR and no ESL gets the resistor and no inductor — the branch
+            // degenerates to the ideal C exactly when nothing is known.
+            std::string a = n1;
+            if (rs) {
+                const std::string mid = n1 + "__" + c.name + "_esr";
+                body << "R" << c.name << "_esr " << a << " " << mid << " " << num(*rs) << "\n";
+                a = mid;
+            }
+            if (ls) {
+                const std::string mid = n1 + "__" + c.name + "_esl";
+                body << "L" << c.name << "_esl " << a << " " << mid << " " << num(*ls) << "\n";
+                a = mid;
+            }
+            body << "C" << c.name << " " << a << " " << n2 << " " << num(*cs) << "\n";
+            if (riso)
+                body << "R" << c.name << "_iso " << a << " " << n2 << " " << num(*riso) << "\n";
         }
         else if (d.contains("semiconductor")) {
             // Faithful emission of the device's SPICE .model card (carried verbatim in
