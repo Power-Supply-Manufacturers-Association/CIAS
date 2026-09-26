@@ -560,14 +560,25 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
             if (d.contains("outputs") && d.at("outputs").is_object()
                     && d.at("outputs").contains("spiceSubcircuit")) {
                 const json& sk = d.at("outputs").at("spiceSubcircuit");
-                body << "X" << c.name << " " << node_of(c.name, "primary_start")
-                     << " " << node_of(c.name, "primary_end");
+                // Each winding enters the subcircuit through a 0 V sense source. Inside an X
+                // instance ngspice exposes no branch current, so without it a simulation could not
+                // report the winding currents of a real magnetic at all. The sources are named like
+                // the ideal path's winding inductors (L<name>_pri / L<name>_sec<n>) with a _sense
+                // suffix, so a consumer finding a winding by that name finds it on either path. A
+                // 0 V source adds no drop: the circuit is unchanged.
+                auto sensed = [&](const std::string& pin, const std::string& winding) {
+                    const std::string outer = node_of(c.name, pin);
+                    const std::string inner = outer + "__" + c.name + "_" + winding + "_sense";
+                    body << "VL" << c.name << "_" << winding << "_sense " << outer << " " << inner << " 0\n";
+                    return inner;
+                };
+                std::string ports = sensed("primary_start", "pri") + " " + node_of(c.name, "primary_end");
                 for (size_t i = 0; i < nsec; ++i) {
                     const std::string idx = std::to_string(i + 1);
-                    body << " " << node_of(c.name, "secondary" + idx + "_start")
-                         << " " << node_of(c.name, "secondary" + idx + "_end");
+                    ports += " " + sensed("secondary" + idx + "_start", "sec" + idx) + " " +
+                             node_of(c.name, "secondary" + idx + "_end");
                 }
-                body << " " << sk.at("reference").get<std::string>() << "\n";
+                body << "X" << c.name << " " << ports << " " << sk.at("reference").get<std::string>() << "\n";
             }
             // DATASHEET path: a real two-terminal inductor, from what the part states.
             // Between the fitted MKF subcircuit above and the ideal L below, and it is the

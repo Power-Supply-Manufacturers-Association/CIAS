@@ -917,7 +917,10 @@ TEST_CASE("magnetic MKF_MODEL path reads outputs.spiceSubcircuit (ABT #947)", "[
                json::array({pin_port_net("np", "L1", "primary_start", "p"),
                             pin_port_net("nn", "L1", "primary_end", "n")})}};
     const std::string net = emit(c);
-    CHECK_THAT(net, ContainsSubstring("XL1 p n WE_123"));
+    // The winding enters through a 0 V sense source, so its current is observable (an X instance
+    // exposes no branch of its own), named like the ideal path's winding inductor.
+    CHECK_THAT(net, ContainsSubstring("VLL1_pri_sense p p__L1_pri_sense 0"));
+    CHECK_THAT(net, ContainsSubstring("XL1 p__L1_pri_sense n WE_123"));
 
     json bad = c;
     bad["components"][0]["data"].erase("outputs");
