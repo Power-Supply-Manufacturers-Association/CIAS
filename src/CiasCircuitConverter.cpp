@@ -1055,6 +1055,10 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                 // set/reset and the 1 ns-RC-delayed state node itself; dominance decides the
                 // ternary NESTING order (the dominant input's check comes first). The output
                 // B-source maps state 0/1 linearly onto outputLow/outputHigh.
+                // The hold branch is REGENERATIVE (V(q)>0.5 ? 1 : 0), not the analog V(q): a
+                // real SR latch is bistable, so a set/reset that releases before the RC has
+                // finished its transition (e.g. a latch whose own output ends its reset) must
+                // still complete to 0 or 1 instead of freezing q at an intermediate level.
                 check_pins(c.name, "latch", {"setPlus", "setMinus", "resetPlus", "resetMinus",
                                              "outPlus", "outMinus"});
                 const double sThr = required("setThreshold");
@@ -1072,7 +1076,7 @@ std::string CiasCircuitConverter::emit_peas_cards(const CiasCircuit& circuit, Sp
                                           + node_of(c.name, "setMinus") + ")>(" + num(sThr) + ")";
                 const std::string rstCond = "V(" + node_of(c.name, "resetPlus") + ","
                                           + node_of(c.name, "resetMinus") + ")>(" + num(rThr) + ")";
-                const std::string hold = "V(" + nq + ")";
+                const std::string hold = tern("V(" + nq + ")>0.5", "1", "0");
                 const std::string stExpr = (dom == "reset")
                     ? tern(rstCond, "0", tern(setCond, "1", hold))    // reset checked FIRST
                     : tern(setCond, "1", tern(rstCond, "0", hold));

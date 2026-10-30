@@ -560,17 +560,17 @@ TEST_CASE("latch dominance decides the ternary nesting order", "[cias][tbas]") {
     const std::string rd = emit(latch_circuit(b));
     // Reset-dominant: the RESET comparison is the OUTER ternary.
     CHECK_THAT(rd, ContainsSubstring(
-        "BL1_st L1__d 0 V=(V(rp,rm)>(1))?(0):((V(sp,sm)>(2))?(1):(V(L1__q)))"));
+        "BL1_st L1__d 0 V=(V(rp,rm)>(1))?(0):((V(sp,sm)>(2))?(1):((V(L1__q)>0.5)?(1):(0)))"));
     // 1 ns RC on the state node + linear 0/1 -> outputLow/outputHigh output stage.
     CHECK_THAT(rd, ContainsSubstring("RL1_st L1__d L1__q 1"));
     CHECK_THAT(rd, ContainsSubstring("CL1_st L1__q 0 1n"));
     CHECK_THAT(rd, ContainsSubstring("BL1 op om V=(0)+((10)-(0))*V(L1__q)"));
     json bs = b; bs["dominance"] = "set";
     CHECK_THAT(emit(latch_circuit(bs)), ContainsSubstring(
-        "BL1_st L1__d 0 V=(V(sp,sm)>(2))?(1):((V(rp,rm)>(1))?(0):(V(L1__q)))"));
+        "BL1_st L1__d 0 V=(V(sp,sm)>(2))?(1):((V(rp,rm)>(1))?(0):((V(L1__q)>0.5)?(1):(0)))"));
     // LTspice uses the if() idiom with the same ordering.
     CHECK_THAT(emit(latch_circuit(b), CIAS::CircuitSimulator::Ltspice), ContainsSubstring(
-        "BL1_st L1__d 0 V=if(V(rp,rm)>(1),0,if(V(sp,sm)>(2),1,V(L1__q)))"));
+        "BL1_st L1__d 0 V=if(V(rp,rm)>(1),0,if(V(sp,sm)>(2),1,if(V(L1__q)>0.5,1,0)))"));
     json bad = b; bad.erase("dominance");
     CHECK_THROWS_WITH(emit(latch_circuit(bad)), ContainsSubstring("dominance"));
 }
